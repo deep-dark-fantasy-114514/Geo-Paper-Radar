@@ -1,0 +1,10 @@
+TY  - JOUR
+TI  - Probabilistic assessment of seepage-induced levee failure and post-failure runout using a GPU-accelerated SPH–random field framework
+PY  - 2026//
+JO  - Engineering Geology
+UR  - https://www.sciencedirect.com/science/article/pii/S0013795226002784?dgcid=rss_sd_all
+AB  - Publication date: August 2026Source: Engineering Geology, Volume 370Author(s): Binqing Wu, Manuel Pastor, Chongshi Gu, Junwei Zheng, Yijun Chen
+KW  - Geo_Paper_Radar
+KW  - Score:25/40
+N1  - 提出GPU加速SPH-随机场框架，实现渗流诱发堤防破坏及溃口演化的概率评估
+ER  - 
