@@ -1,0 +1,14 @@
+TY  - JOUR
+TI  - An end-to-end deep learning framework with nonstationary weighting strategy for enhancing reservoir landslide displacement prediction
+AU  - Ningxin Weng
+AU  - Lei Fan
+AU  - Lihuang Tang
+PY  - 2026//
+JO  - Scientific Reports
+UR  - https://doi.org/10.1038/s41598-026-55915-w
+DO  - 10.1038/s41598-026-55915-w
+KW  - Geo_Paper_Radar_V3.0
+KW  - Source:OpenAlex
+KW  - Score:22/40
+N1  - 提出动态权重生成器，提升水库滑坡位移预测精度。
+ER  - 
