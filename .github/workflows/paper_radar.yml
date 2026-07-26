@@ -1,0 +1,47 @@
+name: Geo Paper Radar Daily
+
+on:
+  schedule:
+    # 每天北京时间 8:07 = UTC 0:07（错峰避免整点拥堵）
+    - cron: '7 0 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  paper-radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write  # 允许自动 commit history.json
+
+    steps:
+      - name: Checkout 仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行文献雷达
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_RECEIVER: ${{ secrets.SMTP_RECEIVER }}
+        run: python paper_radar.py
+
+      - name: 提交 history.json（如有更新）
+        if: success()
+        run: |
+          git config user.name "Geo-Paper-Radar-Bot"
+          git config user.email "bot@geo-paper-radar.local"
+          git add history.json
+          git diff --staged --quiet || (
+            git commit -m "Auto: 更新历史记录 $(date +%Y-%m-%d)" &&
+            git push
+          )

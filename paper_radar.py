@@ -24,6 +24,8 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 
 import feedparser
 import requests
@@ -33,7 +35,8 @@ from openai import OpenAI
 # ──────────────────────────────────────────────
 # 0. 加载环境变量
 # ──────────────────────────────────────────────
-load_dotenv()
+# override=False: 不覆盖已有的环境变量（GitHub Actions Secrets 注入的优先）
+load_dotenv(override=False)
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com")
@@ -784,18 +787,35 @@ def build_html_email_v3(papers):
     return html
 
 
-def send_email(html_content):
+def send_email(html_content, attachments=None):
     print("\n" + "=" * 60)
     print("【发送邮件】")
     print("=" * 60)
     if not all([SMTP_SENDER, SMTP_PASSWORD, SMTP_RECEIVER]):
         print("  [Error] 邮箱配置不完整")
         return False
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = f"🌍 地学前沿推送 V3.0 — {datetime.now().strftime('%Y-%m-%d')}"
     msg["From"] = SMTP_SENDER
     msg["To"] = SMTP_RECEIVER
-    msg.attach(MIMEText(html_content, "html", "utf-8"))
+    # HTML 正文
+    related = MIMEMultipart("related")
+    related.attach(MIMEText(html_content, "html", "utf-8"))
+    msg.attach(related)
+    # 添加 .ris 附件
+    if attachments:
+        for filepath in attachments:
+            if os.path.exists(filepath):
+                with open(filepath, "rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header(
+                        "Content-Disposition",
+                        f"attachment; filename*=UTF-8''{urllib.parse.quote(os.path.basename(filepath))}"
+                    )
+                    msg.attach(part)
+                print(f"  📎 附件: {os.path.basename(filepath)}")
     try:
         print(f"  [进度] 连接 {SMTP_SERVER}:{SMTP_PORT} ...")
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
@@ -896,6 +916,7 @@ def main():
     # ==========================
 
     ris_generated = 0
+    ris_files = []  # 收集所有 .ris 文件路径，用于邮件附件
     if pass_list:
         print(f"\n{'=' * 60}")
         print("【EndNote 联动】生成 .ris 引文文件")
@@ -904,6 +925,7 @@ def main():
             fp = generate_ris_file(p)
             if fp:
                 ris_generated += 1
+                ris_files.append(fp)
                 ds = p.get("data_source", "?")
                 print(f"  ✅ [{ds}] {os.path.basename(fp)}")
 
@@ -920,6 +942,7 @@ def main():
             fp = generate_ris_file(p)
             if fp:
                 ris_generated += 1
+                ris_files.append(fp)
                 print(f"     📄 {os.path.basename(fp)}")
 
     print(f"\n  [汇总] 共生成 {ris_generated} 个 .ris 文件")
@@ -938,7 +961,7 @@ def main():
     else:
         print(f"\n[进入] 准备推送 {len(pass_list)} 篇通关文献...")
         html_content = build_html_email_v3(pass_list)
-        success = send_email(html_content)
+        success = send_email(html_content, attachments=ris_files)
         if success:
             links = [make_link_key(p) for p in pass_list]
             save_history(links)

@@ -29,12 +29,12 @@ if not exist "%SCRIPT_PATH%" (
     exit /b 1
 )
 
-:: 创建计划任务（每天早晨 8:00，以当前用户权限运行）
+:: 创建计划任务（每天早晨 10:00，以当前用户权限运行）
 schtasks /create ^
     /tn "Geo_Paper_Radar_Daily" ^
     /tr "%PYTHON_PATH% \"%SCRIPT_PATH%\"" ^
     /sc daily ^
-    /st 08:00 ^
+    /st 10:00 ^
     /f ^
     /rl HIGHEST
 
@@ -44,7 +44,7 @@ if %ERRORLEVEL% equ 0 (
     echo.
     echo  ┌─────────────────────────────────────────────
     echo  │ 任务名称: Geo_Paper_Radar_Daily
-    echo  │ 执行时间: 每天 08:00
+    echo  │ 执行时间: 每天 10:00
     echo  │ 执行脚本: %SCRIPT_PATH%
     echo  │ 运行身份: 当前用户
     echo  └─────────────────────────────────────────────

@@ -5,7 +5,7 @@ AgentSkillMetadata:
   description: "全自动地学文献抓取（RSS + OpenAlex 双源）→ 两阶段 AI 过滤 → 双轨制筛选 → 邮件推送 + EndNote .ris 引文导出"
   version: "3.0.0"
   author: "Geo_Paper_Radar"
-  tags: ["地学", "文献", "RSS", "OpenAlex", "DeepSeek", "邮件推送", "EndNote", "双轨制", "Windows计划任务"]
+  tags: ["地学", "文献", "RSS", "OpenAlex", "DeepSeek", "邮件推送", "EndNote", "双轨制", "GitHub Actions", "Windows计划任务"]
 ---
 
 # 🌍 Geo_Paper_Radar V3.0 — 地学文献雷达
@@ -52,7 +52,31 @@ SMTP_RECEIVER=receiver@example.com
 
 **中文期刊 ISSN**：编辑 `CHINESE_JOURNALS_ISSN` 列表添加更多中文期刊。
 
-### 2.3 一键部署每日自动推送
+### 2.3 部署到 GitHub Actions（⭐ 推荐，电脑关机也能自动运行）
+
+GitHub Actions 是 GitHub 提供的免费云服务，利用其定时触发器在云端执行，**完全不依赖你的电脑状态**——关机、睡眠、断网都不影响文献推送。
+
+**部署步骤：**
+
+1. **将项目推送到 GitHub 仓库**（见下方命令）
+2. **添加 Secrets**：进入仓库 Settings → Secrets and variables → Actions → New repository secret，逐项添加以下 6 个密钥：
+
+| Secret 名称 | 填写内容 |
+|-------------|---------|
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥 |
+| `SMTP_SERVER` | `smtp.qq.com` |
+| `SMTP_PORT` | `465` |
+| `SMTP_SENDER` | 你的 QQ 邮箱地址 |
+| `SMTP_PASSWORD` | QQ 邮箱授权码 |
+| `SMTP_RECEIVER` | 接收推送的邮箱地址 |
+
+3. **手动触发测试**：仓库 Actions 标签 → "Geo Paper Radar Daily" → "Run workflow"
+
+> 📌 定时执行：每天北京时间 **8:07** 自动运行（GitHub Actions cron）。也可以在 Actions 页面随时手动触发。
+>
+> 📌 费用：公开仓库**完全免费**，私有仓库每月 2000 分钟（单次约 5 分钟，绰绰有余）。
+
+### 2.4 部署到 Windows 计划任务（备选）
 
 以**管理员身份**双击运行 `setup_windows_scheduler.bat`，即可注册 Windows 计划任务：
 
@@ -171,19 +195,22 @@ OpenAlex 返回 200+ 篇
 | AI 评分 | `openai` SDK → DeepSeek Chat API（4 维度）|
 | 邮件发送 | `smtplib` + QQ邮箱 SSL 465 端口 |
 | 引文导出 | 标准 `.ris` 格式（兼容 EndNote / Zotero）|
-| 定时任务 | `schtasks` → Windows 计划任务 |
+| 定时任务 | `schtasks` → Windows 计划任务 / **GitHub Actions cron**（推荐） |
 | 环境配置 | `python-dotenv` |
 
 ## 文件结构
 
 ```
 Geo_Paper_Radar/
-├── .env                              # 环境变量
-├── paper_radar.py                    # 核心脚本 V3.0（~540行）
+├── .env                              # 环境变量（本地使用，不入库）
+├── .gitignore                        # Git 忽略规则
+├── requirements.txt                  # Python 依赖清单
+├── paper_radar.py                    # 核心脚本 V3.0（~980行）
 ├── SKILL.md                          # 本说明书
-├── setup_windows_scheduler.bat       # 一键部署每日自动推送
+├── setup_windows_scheduler.bat       # Windows 计划任务（备选）
 ├── history.json                      # 自动生成 — 已推送文献记录
+├── .github/workflows/
+│   └── paper_radar.yml               # GitHub Actions 定时任务（推荐）
 └── EndNote_Watch/                    # .ris 引文文件存放处
     ├── 2026-06-08_RSS_33分_Innovative model.ris
-    ├── 2026-06-08_Open_30分_Landslide prediction.ris
     └── ...
