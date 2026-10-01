@@ -40,7 +40,9 @@ load_dotenv(override=False)
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+# 空串容错：.env 模板里常见 SMTP_PORT=（空）⇒ int("") 会在【导入阶段】直接崩
+_smtp_port = os.getenv("SMTP_PORT", "").strip()
+SMTP_PORT = int(_smtp_port) if _smtp_port.isdigit() else 465
 SMTP_SENDER = os.getenv("SMTP_SENDER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_RECEIVER = os.getenv("SMTP_RECEIVER", "")
@@ -116,6 +118,35 @@ KEYWORD_LIST_CN = [
     "水土保持", "护坡", "加固"
 ]
 
+# ══════════════════════════════════════════════
+# ★ 2026-10-01：粗筛关键词分级（锚定词 vs 泛化词）
+# ══════════════════════════════════════════════
+# 背景：关键词表里混了一批【泛地学词】。原规则"命中 ≥1 个即通过"下，
+#   一篇只研究"农业灌溉入渗"或"平原地下水超采"的论文，仅凭命中
+#   infiltration / 地下水 就过关。实测 963 篇有摘要候选里，
+#   **134 篇（13%）是只靠一个泛词混进来的纯噪音** —— 样例有
+#   "城市湖泊降温建模"（命中 vegetation）、"机器人时间规整"（命中 stability analysis）、
+#   "大肠杆菌污染"（命中 runoff + groundwater）。
+#
+# 改法：**锚定词×2 + 泛化词×1，达到 COARSE_MIN_SCORE 才算通过**
+#   · 锚定词单独命中 = 2 分 ⇒ 过（如 "landslide"、"优先流"）
+#   · 泛化词单独命中 = 1 分 ⇒ 不过（正是要砍的噪音）
+#   · 两个泛化词   = 2 分 ⇒ 过（如 "groundwater seepage in slopes"，确实相关）
+#   实测：275 → 173 篇，砍掉的正是那批噪音。
+GENERIC_KEYWORDS = {
+    # 英文
+    "runoff", "infiltration", "soil water", "groundwater", "vegetation",
+    "root system", "soil mechanics", "slope angle", "seepage",
+    "stability analysis", "numerical simulation", "finite element",
+    "early warning", "limit equilibrium", "factor of safety",
+    # 中文
+    "径流", "入渗", "地下水", "植被", "根系", "土力学",
+    "稳定性", "渗流", "数值模拟", "有限元", "安全系数",
+    "极限平衡", "稳定性分析", "预警", "加固", "水土保持", "护坡",
+}
+
+COARSE_MIN_SCORE = 2      # 加权分下限（锚定×2 + 泛化×1）
+
 # ---- 历史记录 & EndNote ----
 # ---- ★ 2026-10-01：研究画像 + 主题黑名单（定义在 research_profile.py，改那里即可）----
 from research_profile import (RESEARCH_PROFILE, BLACKLIST_TOPICS,
@@ -133,7 +164,6 @@ ENDNOTE_WATCH_DIR = os.path.join(BASE_DIR, "EndNote_Watch")
 # 首次配置（只做一次）：EndNote → Edit → Preferences → PDF Handling
 #   ☑ Enable automatic importing，PDF Auto Import Folder = 下面这个目录
 PDF_INBOX_DIR = os.path.join(BASE_DIR, "PDF_Inbox")
-PDF_DOWNLOAD_ENABLED = True      # 想临时关掉就设 False
 PDF_MAX_PER_RUN = 20             # 单次最多下几篇，防止失控
 PDF_MAX_MB = 60                  # 单个 PDF 体积上限（MB）
 PDF_MIN_BYTES = 20 * 1024        # 小于 20 KB 的多半是错误页，丢弃
@@ -147,7 +177,13 @@ PDF_MIN_BYTES = 20 * 1024        # 小于 20 KB 的多半是错误页，丢弃
 #   · 本机(Windows) → 完整流程：本地打分 + 下载 + 重命名 + 归档 + 简报
 #   · 云端(Linux)   → 轻量流程：抓取 + DeepSeek 打分 + .ris + 邮件（老行为）
 # 这样同一份代码两边都能跑，不用维护两个分支。
-LOCAL_MODE = (os.name == "nt")
+# 本机/云端判别。默认按平台猜，但**环境变量优先**，便于移植：
+#   PAPER_RADAR_ENV=local | cloud
+# ⚠️ 注意：即便在 Linux 上设成 local，本地打分仍会失败 —— 因为
+#    ask_image.py 的路径是写死的 Windows 路径（C:\Users\zihao\...）。
+#    要真正跨平台，得先把那几处路径也改成配置项。
+LOCAL_MODE = (os.getenv("PAPER_RADAR_ENV", "").strip().lower()
+              or ("local" if os.name == "nt" else "cloud")) == "local"
 PDF_DOWNLOAD_ENABLED = LOCAL_MODE   # 云端下载了也没处放，直接关掉
 
 SCORER = os.getenv("PAPER_RADAR_SCORER",
@@ -225,8 +261,13 @@ HARVEST_ABSTRACT_CHARS = 600  # 摘要截断长度
 HARVEST_CONSUMED = os.path.join(BASE_DIR, ".harvest_consumed.json")
 
 # 仓库 raw 地址（仓库是公开的，无需 token）
-REPO_RAW = ("https://raw.githubusercontent.com/"
-            "deep-dark-fantasy-114514/Geo-Paper-Radar/main/harvest/")
+# ★ 原来是硬编码的。改成可用环境变量覆盖 —— 仓库改名/迁移/Fork 后
+#   只需设 PAPER_RADAR_REPO_RAW，不用改代码。默认值仍是本仓库。
+#   同时 harvest.merge_harvest() 会【记录失败原因】，不再静默跳过。
+REPO_RAW = os.getenv(
+    "PAPER_RADAR_REPO_RAW",
+    "https://raw.githubusercontent.com/"
+    "deep-dark-fantasy-114514/Geo-Paper-Radar/main/harvest/")
 
 # ---- 杂项 ----
 FETCH_HOURS = 24         # RSS 抓取窗口（小时）
@@ -260,13 +301,30 @@ def load_history():
 
 
 def save_history(links):
+    """★ 2026-10-01：改为**原子写入**（写 .tmp 再 os.replace）。
+
+    原来直接 open(..., "w") —— 定时任务被强杀 / 笔记本合盖关机时，
+    如果恰好卡在写文件那一瞬，history.json 会被截断成 0 字节或坏 JSON，
+    之后所有 load_history() 全部失败。
+    `processed.py` 早就是原子写（那是从 COMSOL safe_save 白跑 11.8 小时的教训来的），
+    这里保持一致。
+    """
     existing = load_history()
     existing.update(links)
+    tmp = HISTORY_FILE + ".tmp"
     try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"pushed": list(existing)}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, HISTORY_FILE)
     except Exception as e:
         print(f"  [Warning] 写入历史记录失败: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 def make_link_key(entry):
@@ -291,11 +349,26 @@ def is_within_hours(entry, hours=24):
     return (now - pub_time) <= timedelta(hours=hours)
 
 
+# Windows 保留设备名（这些名字做文件名会被系统拒绝）
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                 "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+                 "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+
+
 def safe_filename(text, max_len=40):
+    """清洗成可用的文件名片段。
+
+    ★ 2026-10-01 补两处 Windows 边界：
+      · **末尾的点和空格**：Windows 会静默吃掉，导致实际文件名与预期不符
+      · **保留设备名**（CON/PRN/AUX/NUL/COM1…）：系统直接拒绝创建
+    """
     safe = re.sub(r'[\\/*?:"<>|]', "", text)
     if len(safe) > max_len:
         safe = safe[:max_len]
-    return safe.strip()
+    safe = safe.strip().rstrip(". ")          # 末尾的点/空格会被 Windows 吃掉
+    if safe.upper() in _WIN_RESERVED:         # 撞保留名 ⇒ 加前缀
+        safe = "_" + safe
+    return safe
 
 
 def infer_journal_name(url):
@@ -311,6 +384,3 @@ def infer_journal_name(url):
         return "未知期刊"
 
 
-# ══════════════════════════════════════════════
-# 3. 模块一：RSS 数据源（保留 V2.0 逻辑）
-# ══════════════════════════════════════════════

@@ -107,7 +107,7 @@ def run_harvest():
     if not cand:
         print("[结果] 没抓到任何候选")
         return 0
-    kept = local_regex_coarse_filter(cand, min_hits=COARSE_MIN_HITS)
+    kept = local_regex_coarse_filter(cand)   # 走加权分规则
     kept, _bl = blacklist_filter(kept)      # ★ 拉黑主题先刷掉，省存储
     if _bl:
         print(f'  [拉黑] 刷掉 {len(_bl)} 篇')

@@ -25,8 +25,7 @@ def local_regex_coarse_filter(papers, min_hits=None):
       这个目的不复存在，而硬卡"≥2 命中"实测只剩 79/1033 篇——**丢掉 93%**，
       正是"漏掉优质文献"的真凶。放宽到 ≥1 后再由本地模型做精细判断。
     """
-    if min_hits is None:
-        min_hits = COARSE_MIN_HITS if SCORER == "local" else 2
+    # min_hits=None ⇒ 走新的【加权分】规则（见下方）；显式传值则退回计数规则
     print("\n" + "=" * 60)
     print("【第一阶段】本地 Regex 粗筛")
     print("=" * 60)
@@ -56,24 +55,30 @@ def local_regex_coarse_filter(papers, min_hits=None):
             n_bypass += 1
             continue
 
-        # 统计命中关键词数
-        hit_count = 0
-        hit_words = []
+        # ★ 2026-10-01：从"命中 ≥N 个词"改成【加权计分】——
+        #   锚定词×2 + 泛化词×1（泛化词表见 config.GENERIC_KEYWORDS）。
+        #   理由见 config.py 里那段注释：只凭一个泛词通过的都是噪音。
+        #   min_hits 仍然保留：显式传了就退回老的"计数"语义，方便对照。
+        anchor_hits, generic_hits = [], []
         for kw in all_keywords_sorted:
             if kw.lower() in text:
-                hit_count += 1
-                hit_words.append(kw)
-                if hit_count >= min_hits:
-                    break
+                (generic_hits if kw in GENERIC_KEYWORDS else anchor_hits).append(kw)
 
-        if hit_count >= min_hits:
-            paper["regex_hits"] = hit_words[:5]  # 记录前 5 个命中词
+        if min_hits is not None:
+            ok = (len(anchor_hits) + len(generic_hits)) >= min_hits
+        else:
+            ok = (2 * len(anchor_hits) + len(generic_hits)) >= COARSE_MIN_SCORE
+
+        if ok:
+            paper["regex_hits"] = (anchor_hits + generic_hits)[:5]
+            paper["_regex_score"] = 2 * len(anchor_hits) + len(generic_hits)
             passed.append(paper)
 
     print(f"  [输入] {len(papers)} 篇 → 粗筛后 {len(passed)} 篇"
           f"（其中 {n_bypass} 篇是无摘要直接放行）")
-    print(f"  [规则] 有摘要者命中 ≥{min_hits} 个核心关键词；"
-          f"无摘要者全收（交本地模型判）")
+    _rule = (f"命中 ≥{min_hits} 个关键词" if min_hits is not None
+             else f"加权分 ≥{COARSE_MIN_SCORE}（锚定词×2 + 泛化词×1）")
+    print(f"  [规则] 有摘要者：{_rule}；无摘要者全收（交本地模型判）")
     print(f"  [中文关键词数] {len(KEYWORD_LIST_CN)} 个   [英文关键词数] {len(KEYWORD_LIST_EN)} 个")
 
     # 打印几个样本

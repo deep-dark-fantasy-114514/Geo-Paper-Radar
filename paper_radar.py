@@ -294,7 +294,7 @@ def main():
 
     if browsing_list:
         print(f"\n{'=' * 60}")
-        print("【备选泛读列表】（仅终端 + .ris，不发送邮件）")
+        print("【备选泛读列表】（正文只在终端列，但 .ris 附件【一并发送】——用户 2026-10-01 确认）")
         print("=" * 60)
         for idx, p in enumerate(browsing_list, 1):
             ts = p.get("total_score", 0)
