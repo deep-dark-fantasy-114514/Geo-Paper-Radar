@@ -36,6 +36,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -45,22 +46,33 @@ except Exception:
     pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+
+from config import norm_title          # noqa: E402  全仓唯一的标题清洗实现
+
 FILE = os.path.join(BASE_DIR, "processed.json")
+
+# --forget 的防护（见 CLI 里的说明）
+FORGET_MIN_LEN = 5      # 匹配串最短长度：挡住 " "、"doi:"、"2026" 这类
+FORGET_MAX_SAFE = 5     # 单次删除超过这么多条就要加 --yes 二次确认
 
 _cache = None
 
 
 # --------------------------------------------------------------- 键
 def key_of(paper):
-    """与 library_manager.key_of 保持一致的键规则。"""
-    doi = (paper.get("doi") or "").strip().lower()
-    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
+    """全生命周期唯一标识：优先规范化 DOI，其次规范化标题（截断 120 字）。
+
+    ★ 2026-10-01：标题清洗改为调用 `config.norm_title` —— 全仓唯一实现。
+      原来 `sources._norm_title_key` / `manual_ingest._norm_title` 各写一份，
+      已经漂了（manual_ingest 那份漏了"剥标签"）。三份算法算出三把键，
+      跨清单匹配（download_list ↔ processed ↔ 销账）就可能对不上。
+    """
+    doi = re.sub(r"^https?://(dx\.)?doi\.org/",
+                 "", (paper.get("doi") or "").strip(), flags=re.I).strip().lower()
     if doi:
         return "doi:" + doi
-    t = (paper.get("title") or "").strip().lower()
-    t = re.sub(r"<[^>]+>", " ", t)                    # 去掉 XML 标签
-    t = re.sub(r"[^0-9a-z一-鿿 ]", "", re.sub(r"\s+", " ", t))
-    return "title:" + t.strip()[:120]   # ★ strip：标签替换会留下前导空格
+    return "title:" + norm_title(paper.get("title"))[:120]
 
 
 # --------------------------------------------------------------- 读写
@@ -122,10 +134,21 @@ def mark(paper, status="seen", score=None):
     #    seen 前面，"打分后被标 seen" 就会把它顶掉 ⇒ 永远记不上 failed ⇒
     #    次日不重试（这正是要修的那个 bug）。而重试成功写 filed(4) 仍能覆盖它。
     rank = {"seen": 1, "failed": 2, "listed": 3, "filed": 4}
-    if old and isinstance(old, list) and len(old) > 1:
-        if rank.get(old[1], 0) > rank.get(status, 0):
-            status = old[1]              # 保留更"靠后"的状态
-    rec = [today, status]
+    old_status = old[1] if (isinstance(old, list) and len(old) > 1) else None
+    if old_status and rank.get(old_status, 0) > rank.get(status, 0):
+        status = old_status              # 保留更"靠后"的状态
+
+    # ★ 2026-10-01【日期只在状态真的推进时才刷新】。
+    #   原来 `rec = [today, status]` 无条件写今天 ⇒ 一条几个月前的记录只要被
+    #   "触碰"一下就冒充成最近处理过的：`--recent 7` 会把历史文献混进来，统计失真。
+    #   现在状态没变就沿用原日期（= 首次录入日）。
+    #   可达路径：failed 的文献天天重试（mark_many 每轮都标一次 seen，被 rank 挡住
+    #   状态不变）；或手动重跑 manual_ingest 对同一篇再次 mark("filed")。
+    if old and old_status == status and old[0]:
+        day = old[0]
+    else:
+        day = today
+    rec = [day, status]
     if score is not None:
         rec.append(int(score))
     elif old and len(old) > 2:
@@ -160,11 +183,16 @@ def filter_new(papers):
             continue
         if st == "failed":
             retry += 1
+            # ★ 打标记，让 paper_radar 把这篇【无条件】塞进下载/归档批次。
+            #   否则它要重新挤过 pass/browse 阈值才轮得到重试；而重新打分
+            #   （temperature 0.1，非严格确定）万一低了 1 分，这篇就永远
+            #   出不了 failed —— 归档重试机制形同虚设。
+            p["_retry_archive"] = True
         out.append(p)
     if skipped:
         print("  [去重] 已处理过 %d 篇，跳过；本轮新文献 %d 篇" % (skipped, len(out)))
     if retry:
-        print("  [重试] 其中 %d 篇上次归档失败，本轮重试" % retry)
+        print("  [重试] 其中 %d 篇上次归档失败，本轮重走下载/归档" % retry)
     return out
 
 
@@ -183,8 +211,16 @@ def main():
         n, c = stats()
         print("去重表：%s" % FILE)
         print("  总计 %d 条" % n)
-        for k in ("seen", "listed", "filed"):
-            print("    %-8s %d" % (k, c.get(k, 0)))
+        # ★ 2026-10-01：原来硬编码 ("seen","listed","filed") 三项 —— 加了
+        #   "failed" 之后它被直接吞掉，用户看不到有多少篇卡在重试里。
+        #   改成动态遍历，将来再加状态也不用改这里。
+        known = ["seen", "listed", "filed", "failed"]
+        for k in known:
+            if c.get(k):
+                _note = "   ← 归档失败，等下次重试" if k == "failed" else ""
+                print("    %-8s %d%s" % (k, c[k], _note))
+        for k in sorted(set(c) - set(known)):
+            print("    %-8s %d   ← 未知状态" % (k, c[k]))
         if os.path.exists(FILE):
             print("  文件大小 %.1f MB" % (os.path.getsize(FILE) / 1e6))
         return 0
@@ -203,9 +239,45 @@ def main():
 
     if "--forget" in sys.argv:
         i = sys.argv.index("--forget")
-        pat = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        pat = (sys.argv[i + 1] if i + 1 < len(sys.argv) else "").strip()
+
+        # ★ 2026-10-01【加防护】。原来 `pat and pat.lower() in k.lower()` 就删，
+        #   既没有长度下限也没有确认，也没有备份 —— 手滑一下就不可逆。
+        #   实际能踩的坑：
+        #     --forget " "   → 所有 title: 键（中文/英文标题都带空格）全没
+        #     --forget doi:  → 所有 doi: 键全没
+        #   而删光去重表的后果是【次日全量历史文献重新抓取/重复打分/重复推送】。
+        if len(pat) < FORGET_MIN_LEN:
+            print("[拒绝] 匹配串太短（%d 个字符），下限是 %d。"
+                  % (len(pat), FORGET_MIN_LEN))
+            print("       像 'doi:' 或一个空格会把整类记录一次删光。")
+            print("       请给一个更具体的片段，例如 doi:10.1016/j.enggeo.2026")
+            return 2
+
         d = load()
-        hit = [k for k in d if pat and pat.lower() in k.lower()]
+        hit = [k for k in d if pat.lower() in k.lower()]
+        if not hit:
+            print("没有匹配到任何条目，未改动。")
+            return 0
+
+        if len(hit) > FORGET_MAX_SAFE and "--yes" not in sys.argv:
+            print("[拒绝] 命中 %d 条，超过安全阈值 %d。" % (len(hit), FORGET_MAX_SAFE))
+            print("       核对下面这些确实是你要删的，再加 --yes 重跑：")
+            for k in hit[:15]:
+                print("         " + k[:88])
+            if len(hit) > 15:
+                print("         …… 另外 %d 条" % (len(hit) - 15))
+            return 2
+
+        # 删前先备份：--forget 是唯一会【减少】记录的入口，误删不可逆
+        if os.path.exists(FILE):
+            bak = FILE + ".bak_forget_" + time.strftime("%Y%m%d_%H%M%S")
+            try:
+                shutil.copy2(FILE, bak)
+                print("已备份：%s" % bak)
+            except Exception as e:
+                print("[警告] 备份失败（继续执行）：%s" % e)
+
         for k in hit:
             del d[k]
         _save()

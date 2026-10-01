@@ -47,6 +47,7 @@ sys.path.insert(0, BASE_DIR)
 
 import library_manager as lm          # noqa: E402
 import processed                      # noqa: E402   ★ 入库后要回报中央去重表
+from config import norm_title         # noqa: E402   全仓唯一的标题清洗实现
 
 DEFAULT_TEMPLATE = "{year}_{author}_{title_zh}"
 INGESTED_MARK = os.path.join(lm.DOWNLOAD_LIST_DIR, "_已入库.json")
@@ -99,9 +100,15 @@ def _norm_doi(s):
 
 
 def _norm_title(s):
-    """标题归一化：压空白 + 转小写 + 去标点。与 processed.key_of 同规则。"""
-    t = re.sub(r"\s+", " ", (s or "").strip().lower())
-    return re.sub(r"[^0-9a-z一-鿿 ]", "", t)
+    """标题归一化。
+
+    ★ 2026-10-01：改为调用 `config.norm_title`（全仓唯一实现）。
+      本地这份原来漏了「剥离 XML 标签」这一步 —— 而 `processed.key_of`
+      和 `sources._norm_title_key` 都有。含 `<i>` 之类标签的标题会算出
+      不同的键，`load_pending_index` 建的索引和 `processed.key_of` 算的
+      销账键就对不上。
+    """
+    return norm_title(s)
 
 
 def load_pending_index():

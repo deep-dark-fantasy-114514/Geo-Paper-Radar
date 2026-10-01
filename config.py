@@ -439,6 +439,26 @@ def safe_filename(text, max_len=40):
     return safe
 
 
+def norm_title(title):
+    """标题归一化：**剥离 XML 标签 → 压空白 → 去标点 → 转小写**。
+
+    ★ 2026-10-01：这是全仓唯一实现。原来三处各写一份，已经漂了 ——
+      `manual_ingest._norm_title` 漏掉"剥标签"这一步，而 `sources._norm_title_key`
+      和 `processed.key_of` 有。三份算出三把键，跨清单匹配就可能对不上。
+
+    ⚠️ 处理顺序很关键：**必须先剥标签再删标点**。反过来会把标签里的字母留下 ——
+      实测 `<i>Preferential flow</i> in slopes` 会被规范化成
+      `ipreferential flowi in slopes`，从而漏判重复。
+
+    调用方：`processed.key_of` / `sources._norm_title_key` / `manual_ingest`。
+    """
+    t = (title or "").strip().lower()
+    t = re.sub(r"<[^>]+>", " ", t)            # 先剥标签（否则字母残留）
+    t = re.sub(r"\s+", " ", t)                # 压空白
+    t = re.sub(r"[^0-9a-z一-鿿 ]", "", t)     # 去标点
+    return t.strip()
+
+
 def unique_path(path):
     """重名不覆盖：`x.pdf` 已存在就退到 `x (1).pdf`。"""
     if not os.path.exists(path):

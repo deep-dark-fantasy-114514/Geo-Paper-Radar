@@ -330,7 +330,16 @@ def main():
     # ==========================
     # 下到 PDF_Inbox ⇒ EndNote 的「PDF 自动导入文件夹」会自动入库，
     # 从而免去"去 QQ 邮箱手动下载 .ris 再导入"这一步。
-    pdf_saved, filed_keys, deferred_keys = download_all_oa_pdfs(pass_list + browsing_list)
+    # ★ 2026-10-01：上轮归档失败的那些（processed 里状态为 failed）会带
+    #   `_retry_archive` 标记。它们【无条件】进这一批 —— 否则要重新挤过
+    #   pass/browse 阈值才轮得到重试，而重打分有微小漂移，一旦低了 1 分
+    #   这篇就永远出不了 failed，重试机制形同虚设。
+    #   （不会重复下载：download_oa_pdf 在暂存区里命中原文件就幂等返回。）
+    _retry = [p for p in scored_papers if p.get("_retry_archive")]
+    if _retry:
+        print(f"\n  [归档重试] {len(_retry)} 篇上轮归档失败，一并重走下载/归档")
+    pdf_saved, filed_keys, deferred_keys = download_all_oa_pdfs(
+        pass_list + browsing_list + _retry)
     # ★ 2026-10-01：deferred_keys = 因本轮的 PDF_MAX_PER_RUN 限额而【没下】的。
     #   它们【不能】被打上 listed，否则 processed.filter_new 次日永久拦掉它们，
     #   本来能自动下载的 OA 文献仅因排在第 21 篇之后就被迫转手动。

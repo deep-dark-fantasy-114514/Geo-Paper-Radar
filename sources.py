@@ -598,18 +598,14 @@ def enrich_abstracts_web(papers, max_lookups=40, min_gap=1.5):
 def _norm_title_key(title):
     """规范化标题，用于跨源去重。
 
-    ⚠️ 规则必须与 `processed.key_of()` / `library_manager.key_of()` **保持一致**，
-       否则同一篇会算出不同的键，去重失效。
+    ★ 2026-10-01：实现搬到 `config.norm_title`（全仓唯一）。本文件、
+      `processed.key_of`、`manual_ingest` 原来各写一份，已经漂过一次
+      （manual_ingest 那份漏了"剥标签"）。这里只留薄封装，不再自带规则。
 
-    处理顺序很关键：**先剥 HTML 标签，再删标点**。
-    反过来会把标签里的字母留下 —— 实测 `<i>Preferential flow</i> in slopes`
-    会被规范化成 `ipreferential flowi in slopes`，从而漏判重复。
+    ⚠️ 与 `processed.key_of` 的**唯一**差别：那边返回时截断 120 字，这边不截。
+      跨源去重要求全标题比对；而且两者从不互相比较，无碍。
     """
-    t = (title or "").strip().lower()
-    t = re.sub(r"<[^>]+>", " ", t)          # 先剥标签（否则字母残留）
-    t = re.sub(r"\s+", " ", t)              # 压空白
-    t = re.sub(r"[^0-9a-z一-鿿 ]", "", t)   # 去标点
-    return t.strip()
+    return norm_title(title)
 
 
 def dedupe_by_title(papers):
