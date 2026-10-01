@@ -88,12 +88,30 @@ MAX_EMAIL_RESULTS = 15     # 邮件正文里列几篇（正文越短越好读）
 MAX_BROWSING_RESULTS = 60  # 备选泛读最多留几篇（进简报与下载清单）
 MAX_DEEPSEEK_INPUT = 40     # 进入 DeepSeek 阶段的文献上限（防 API 费用暴涨）
 
-# ---- 中文核心期刊 ISSN（预留扩展列表）----
-CHINESE_JOURNALS_ISSN = [
-    "1000-6915",    # 岩石力学与工程学报
-    "1000-4548",    # 岩土工程学报
-    "1000-2383",    # 地球科学
-    # 在此继续添加更多中文期刊 ISSN
+# ---- 中文核心期刊 ISSN（★ 全仓唯一来源）----
+# ★ 2026-10-01：`{刊名: ISSN}` 是权威表；`CHINESE_JOURNALS_ISSN` 由它派生。
+#   原来 sources.py 里还另有一份 CN_JOURNAL_ISSN（同样三本），
+#   等于"加了一本新刊、另一处不同步"的经典坑。
+CHINESE_JOURNALS = {
+    "岩土工程学报": "1000-4548",
+    "岩石力学与工程学报": "1000-6915",
+    "地球科学": "1000-2383",
+    # 在此继续添加更多中文期刊
+}
+CHINESE_JOURNALS_ISSN = list(CHINESE_JOURNALS.values())
+
+# ---- OpenAlex 核心检索词（★ 2026-10-01 从 sources.py 搬来）----
+# 原来硬编码在 OpenAlexFetcher.fetch_papers() 里 ⇒ 别的源（Crossref / arXiv /
+# 学位论文）都能在 config 调，唯独 OpenAlex 主源不能 —— 很容易出现
+# "以为改配置改了检索策略，其实 OpenAlex 没变"。
+# 注意：OpenAlex 空格 = AND，所以每个词尽量短。
+OPENALEX_QUERIES = [
+    "landslide",
+    "slope stability",
+    "rainfall infiltration",
+    "preferential flow",
+    "debris flow",
+    "unsaturated soil",
 ]
 
 # ---- 中英双语关键词库（用于第一层 Regex 粗筛）----

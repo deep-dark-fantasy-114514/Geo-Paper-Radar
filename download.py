@@ -164,7 +164,7 @@ def _paper_key(paper):
     """
     k = _proc_key(paper)
     if not k or k == "title:":
-        u = (paper.get("oa_pdf_url") or "").strip()
+        u = (paper.get("oa_pdf_url") or paper.get("oa_landing_url") or "").strip()
         k = ("url:" + u) if u else ("ttl:" + (paper.get("title") or ""))
     return hashlib.sha256(k.encode("utf-8")).hexdigest()[:12]
 
@@ -208,7 +208,11 @@ def download_oa_pdf(paper, dest_dir=None):
     """
     if not PDF_DOWNLOAD_ENABLED:
         return None
-    url = (paper.get("oa_pdf_url") or "").strip()
+    # ★ 2026-10-01：`oa_pdf_url` 现在【只装确定的 PDF 直链】；
+    #   没有直链但有 OA 落地页时，退而用落地页（下面会从它页里找
+    #   `citation_pdf_url`）。原来 sources 把两者混在一个字段里，
+    #   本条只是把既有的实际行为写成显式的两步。
+    url = (paper.get("oa_pdf_url") or paper.get("oa_landing_url") or "").strip()
     if not url:
         return None
     if dest_dir is None:
@@ -329,9 +333,10 @@ def download_all_oa_pdfs(papers):
     if not PDF_DOWNLOAD_ENABLED:
         print("\n  [PDF] 自动下载已关闭（PDF_DOWNLOAD_ENABLED=False）")
         return [], set(), set()
-    oa_papers = [p for p in papers if p.get("oa_pdf_url")]
+    # ★ 现在 oa_pdf_url 只装 PDF 直链；有落地页的也算"能试一次"(见 download_oa_pdf)
+    oa_papers = [p for p in papers if (p.get("oa_pdf_url") or p.get("oa_landing_url"))]
     print(f"\n{'=' * 60}")
-    print(f"【OA PDF 下载 → 重命名 → 归档】{len(oa_papers)}/{len(papers)} 篇有 OA 链接"
+    print(f"【OA PDF 下载 → 重命名 → 归档】{len(oa_papers)}/{len(papers)} 篇有 OA 直链或落地页"
           f"（本轮上限 {PDF_MAX_PER_RUN}）")
     print("=" * 60)
     if not oa_papers:

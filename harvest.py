@@ -93,7 +93,7 @@ def fetch_all_candidates():
 
 HARVEST_FIELDS = ("title", "link", "source", "data_source", "doi", "authors",
                   "year", "issn", "is_chinese_journal", "openalex_id",
-                  "oa_pdf_url", "is_oa", "regex_hits")
+                  "oa_pdf_url", "oa_landing_url", "is_oa", "regex_hits")
 
 
 def run_harvest():

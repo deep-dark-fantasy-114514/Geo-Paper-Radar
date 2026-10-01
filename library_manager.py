@@ -288,8 +288,12 @@ def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None,
                 L.append(f"- 创新点：{_md(p['tldr'])}")
             if p.get("reason"):
                 L.append(f"- 推荐理由：{_md(p['reason'])}")
+            # ★ 2026-10-01：oa_pdf_url 现在只装 PDF 直链；没有直链时退到 OA
+            #   落地页 —— 标签也要跟着改，别把网页说成 "PDF"。
             if p.get("oa_pdf_url"):
                 L.append(f"- [开放获取 PDF]({p['oa_pdf_url']})")
+            elif p.get("oa_landing_url"):
+                L.append(f"- [开放获取页面]({p['oa_landing_url']})")
             L.append("")
 
     if browsing_list:

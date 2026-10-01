@@ -40,8 +40,23 @@ import urllib.parse
 
 import feedparser
 
+# ★ 2026-10-01：`datetime` / `timedelta` 原来【只靠下面的 `from config import *`
+#   带进来】（config.py 里有 `from datetime import datetime, timedelta, timezone`）。
+#   今天能跑，但这个耦合很脆：config 一旦加 `__all__`、或调整自己的 import，
+#   这里立刻 NameError —— 而 `_fetch_single_query()` 把异常全吃了，
+#   **表现是"OpenAlex 今天 0 篇"，不是报错**。显式导入，掐掉这种静默失效。
+from datetime import datetime, timedelta          # noqa: F401
+
 from config import *   # 常量（RSS_SOURCES / OPENALEX_* / CHINESE_JOURNALS_ISSN 等）与工具函数
 import requests
+
+# ★ 2026-10-01：`datetime` / `timedelta` 原来【只靠 `from config import *` 带进来】
+#   （config.py 里有 `from datetime import datetime, timedelta, timezone`）。
+#   今天能跑，但这个耦合很脆：config 一旦加 `__all__`、或调整自己的 import，
+#   这里就会立刻 NameError —— 而 `_fetch_single_query()` 把异常全吃了，
+#   **表现是"OpenAlex 今天 0 篇"，不是报错**。
+#   显式导入，把这类静默失效的可能性直接掐掉。
+from datetime import datetime, timedelta      # noqa: F401
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -67,8 +82,22 @@ OPENALEX_KEY = os.getenv("OPENALEX_API_KEY", "").strip()
 
 
 def _auth_headers(url):
-    """OpenAlex 需要 Authorization 头；其它源不需要。"""
-    if OPENALEX_KEY and "api.openalex.org" in url:
+    """OpenAlex 需要 Authorization 头；其它源不需要。
+
+    ★ 2026-10-01：原来是子串判断 `"api.openalex.org" in url` ——
+      `https://api.openalex.org.attacker.example/x` 也满足它，
+      于是 **OpenAlex 的 API key 会被发给第三方**。
+      今天所有 URL 都是我们自己拼的，暂时打不出来；但 `polite_get()`
+      是公共函数，将来任何数据源都能调它 —— 边界就该是边界。
+      ⇒ 改成按 hostname 精确比较。
+    """
+    if not OPENALEX_KEY:
+        return {}
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        return {}
+    if host == "api.openalex.org":
         return {"Authorization": "Bearer " + OPENALEX_KEY}
     return {}
 
@@ -77,11 +106,12 @@ def _auth_headers(url):
 #   避免"在 config 加了新刊、这里不同步"的问题。
 CHINESE_ISSN = set(CHINESE_JOURNALS_ISSN)
 
-# 死掉的 RSS 源不再重试；改用 issn 走 API 拿
-DEAD_RSS = {
-    "https://link.springer.com/search.rss?facet-journal-id=10346&channel-name=Landslides",
-    "https://agupubs.onlinelibrary.wiley.com/action/showFeed?jc=1944-7973&type=etoc&feed=rss",
-}
+# ★ 2026-10-01：删掉了这里的 `DEAD_RSS = {...}`。
+#   它是【死代码】—— 定义了却从没人读；而那两个死源早已从
+#   config.RSS_SOURCES 里移除，所以"每次跑都请求死源"并不成立。
+#   真正生效的防线改在 fetch_papers_from_rss() 里读 config.DEAD_RSS_BLACKLIST
+#   （原来那个配置项同样是死的，现在让它真的起作用：
+#    万一以后有人又把死源加回 RSS_SOURCES，会被直接跳过而不是每次白试。）
 
 # 期刊 ISSN（替代死掉的 RSS）
 JOURNAL_ISSN = {
@@ -97,6 +127,49 @@ _last_call = [0.0]
 # ══════════════════════════════════════════════
 # 1. 统一的礼貌请求
 # ══════════════════════════════════════════════
+def polite_gap(min_gap=1.0):
+    """只做【模块级统一礼貌间隔】，不发起请求。
+
+    ★ 2026-10-01：`_last_call` 是模块级的，本意是"所有源串行、总速率封顶"，
+      但 `polite_get()` 之外还有三条路自己发请求（RSS 自建 Session、
+      Semantic Scholar、网页补摘要），**完全绕开了这个限流器**。
+      于是"统一礼貌请求"这个设计只覆盖了一半的数据源。
+      这里把间隔拿出来单独成函数，让那些"不能走 polite_get 的调用"
+      （要 XML 的 arXiv 式请求、要 HTML 的落地页、S2 的特殊返回结构）
+      至少也落进同一道节流里。
+    """
+    gap = time.time() - _last_call[0]
+    if gap < min_gap:
+        time.sleep(min_gap - gap + random.uniform(0, min_gap * 0.2))
+    _last_call[0] = time.time()
+
+
+def _parse_retry_after(raw):
+    """解析 Retry-After 头，返回秒数（解析不了返回 0）。
+
+    ★ 2026-10-01：原来只做 `float(ra)`。而 HTTP 规范里 `Retry-After`
+      还允许 **HTTP-date** 格式（`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`），
+      那是服务器最正式的表达。`float()` 抛 ValueError 后被吞成 0
+      ⇒ 我们按自己的 1.5s/3s/6s 去重试，**完全无视服务器说的"等多久"**，
+      既不礼貌，也很容易再次撞 429。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return 0.0
+    try:
+        return max(0.0, float(s))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        if dt is not None:
+            return max(0.0, (dt - datetime.now(dt.tzinfo)).total_seconds())
+    except Exception:
+        pass
+    return 0.0
+
+
 def polite_get(url, params=None, timeout=45, retries=4, base_delay=1.5,
                min_gap=1.0, expect_json=True, headers_override=None):
     """带指数退避的 GET。
@@ -122,11 +195,7 @@ def polite_get(url, params=None, timeout=45, retries=4, base_delay=1.5,
             if r.status_code in (429, 500, 502, 503, 504):
                 # ★ OpenAlex 的 429 里 retryAfter 可能长达数万秒（等下一天）——
                 #   那种情况重试没意义，直接放弃并说明原因，别把整批拖死。
-                ra = r.headers.get("Retry-After")
-                try:
-                    ra_s = float(ra) if ra else 0
-                except ValueError:
-                    ra_s = 0
+                ra_s = _parse_retry_after(r.headers.get("Retry-After"))
                 if r.status_code == 429 and ra_s > 300:
                     key_hint = ("" if OPENALEX_KEY else
                                 "  ⇒ 需在 .env 里填 OPENALEX_API_KEY"
@@ -183,8 +252,22 @@ def norm_doi(d):
 
 
 def pack(title, link, summary, source, data_source, doi="", authors=None,
-         year=None, issn=None, oa_pdf_url="", is_oa=False, extra=None):
-    """打包成与 paper_radar 一致的字段结构。"""
+         year=None, issn=None, oa_pdf_url="", is_oa=False, extra=None,
+         oa_landing_url=""):
+    """打包成与 paper_radar 一致的字段结构。
+
+    ★★ 2026-10-01【oa_pdf_url 与 oa_landing_url 必须分开】★★
+      原来只有一个 `oa_pdf_url`，而 OpenAlex 那边写的是
+      `best_oa.pdf_url or open_access.oa_url` —— 后者的官方定义是
+      **"最佳 OA location 的 URL"**，可能只是出版社/仓储的**落地页**，不是 PDF。
+      于是字段名说谎：`oa_pdf_url` 里躺着一个网页。
+      表现就是 download.py 常常拉回 HTML、再靠 `citation_pdf_url` 二次找直链
+      （那条兜底路径能救回来，所以成功率没归零，但语义一直是错的）。
+      ⇒ 现在：
+          oa_pdf_url     —— 只放**确定的 PDF 直链**
+          oa_landing_url —— OA 落地页（download.py 会拿它去页里找 citation_pdf_url）
+      两者都给 download.py 用，但用途分明。
+    """
     issn = issn or []
     rec = {
         "title": (strip_jats(title) or "").strip(),
@@ -199,6 +282,7 @@ def pack(title, link, summary, source, data_source, doi="", authors=None,
         "is_chinese_journal": any((i or "").strip() in CHINESE_ISSN for i in issn),
         "openalex_id": "",
         "oa_pdf_url": oa_pdf_url or "",
+        "oa_landing_url": oa_landing_url or "",
         "is_oa": bool(is_oa),
     }
     if extra:
@@ -309,7 +393,13 @@ def _oa_to_paper(w, tag="OpenAlex"):
         ab = " ".join(pos[k] for k in sorted(pos))
     best = w.get("best_oa_location") or {}
     oa = w.get("open_access") or {}
-    pdf = (best.get("pdf_url") or oa.get("oa_url") or "").strip()
+    # ★ 2026-10-01：`best_oa_location.pdf_url` 才是 PDF 直链；
+    #   `open_access.oa_url` 按官方定义是"最佳 OA location 的 URL"（可能是落地页）。
+    #   原来用 `or` 把两者并成一个字段，等于让落地页冒充 PDF 直链。现已分开。
+    pdf = (best.get("pdf_url") or "").strip()
+    landing = (oa.get("oa_url") or "").strip()
+    if not landing:
+        landing = (best.get("landing_page_url") or "").strip()
     doi = w.get("doi") or ""
     auth = [((a.get("author") or {}).get("display_name") or "")
             for a in (w.get("authorships") or [])][:10]
@@ -318,7 +408,8 @@ def _oa_to_paper(w, tag="OpenAlex"):
                 doi=doi, authors=[a for a in auth if a],
                 year=w.get("publication_year"),
                 issn=(((pl.get("source") or {}).get("issn")) or []),
-                oa_pdf_url=pdf, is_oa=bool(oa.get("is_oa") or pdf))
+                oa_pdf_url=pdf, oa_landing_url=landing,
+                is_oa=bool(oa.get("is_oa") or pdf or landing))
 
 
 def fetch_openalex_dissertations(queries, days=365, per_query=60, max_total=200):
@@ -362,11 +453,10 @@ def fetch_openalex_dissertations(queries, days=365, per_query=60, max_total=200)
 #   1. OpenAlex 的 language 字段不可靠（中文刊常标成 en）⇒ 别用 language 过滤，用 issn
 #   2. 近期收录有滞后（岩石力学与工程学报近半年 80 篇，岩土工程学报近半年 0 篇），
 #      且**无摘要**、标题是英译 ⇒ 只能到"题目级别"，靠本地模型看标题判断
-CN_JOURNAL_ISSN = {
-    "岩土工程学报": "1000-4548",
-    "岩石力学与工程学报": "1000-6915",
-    "地球科学": "1000-2383",
-}
+# ★ 2026-10-01：这里原来又抄了一份三本刊的 {刊名: ISSN} —— 与
+#   config.CHINESE_JOURNALS_ISSN 是两个 authority（"加了一本新刊、
+#   另一处不同步"的经典坑）。现在统一从 config 取。
+CN_JOURNAL_ISSN = dict(CHINESE_JOURNALS)
 
 
 def fetch_openalex_journals(issns=None, days=90, per_journal=60, max_total=200):
@@ -447,7 +537,11 @@ def fetch_semanticscholar(queries, limit=100, api_key=None):
         print(f"  [S2] {q!r}{'（有 key）' if key else '（匿名，很可能 429）'}")
         r = None
         try:
-            _last_call[0] = time.time()
+            # ★ 2026-10-01：原来只是把 `_last_call[0]` 拍成 now，**没有等待** ——
+            #   那不是限流，只是"记录一下"。现在走统一的 polite_gap()，
+            #   与 polite_get 共用同一个模块级节流窗口（S2 官方建议 ≤1 req/s，
+            #   这里保守取 3 s，因为它是最容易被 429 的一家）。
+            polite_gap(3.0)
             r = _session.get(
                 "https://api.semanticscholar.org/graph/v1/paper/search",
                 params={"query": q, "limit": min(limit, 100),
@@ -519,13 +613,25 @@ def enrich_abstracts(papers, max_lookups=120):
 # 任何读者都在做的事，**不是绕过付费墙**。本函数只读 meta / JSON-LD 里
 # 已经公开的摘要字段，不碰正文、不碰 PDF。
 # 若出版商用反爬（ScienceDirect 常见）返回挑战页，就老实返回空，不硬闯。
-WEB_META_PATTERNS = [
+# ★ 2026-10-01【按可信度分级】。原来这五条是**平铺**的、谁先匹配用谁 ——
+#   于是 `og:description`（网页 SEO 描述）和 `"description"`（JSON-LD 里
+#   任意对象的描述字段）都能被当成论文摘要送去做四维打分。
+#   实测能捞到的例子就像 "Explore cutting-edge research published in…"
+#   这种网站自我介绍 —— 喂给 Qwen 会凭空产出一个分数。
+#   ⇒ 只让 A/B 级进 summary；C 级单独放 web_description，仅作参考不进打分。
+WEB_META_PATTERNS_HIGH = [      # A 级：出版商专门为本文声明的摘要
     r'<meta[^>]+name=["\']citation_abstract["\'][^>]+content=["\']([^"\']{80,}?)["\']',
     r'<meta[^>]+content=["\']([^"\']{80,}?)["\'][^>]+name=["\']citation_abstract["\']',
+]
+WEB_META_PATTERNS_MID = [       # B 级：DC 元数据，通常是摘要
     r'<meta[^>]+name=["\'](?:dc|DCTERMS)\.description["\'][^>]+content=["\']([^"\']{80,}?)["\']',
+]
+WEB_META_PATTERNS_LOW = [       # C 级：可能是 SEO 描述 / 网站介绍，不一定是论文摘要
     r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']{80,}?)["\']',
     r'"description"\s*:\s*"((?:[^"\\]|\\.){80,}?)"',
 ]
+# 兼容旧名（有地方可能引用）
+WEB_META_PATTERNS = WEB_META_PATTERNS_HIGH + WEB_META_PATTERNS_MID
 _WEB_HDR = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
@@ -540,8 +646,19 @@ def fetch_abstract_from_web(doi, timeout=25):
     if not doi:
         return ""
     try:
+        # ★ 2026-10-01：这些请求原来【完全绕开】统一限流器（调用方只是
+        #   `time.sleep(min_gap)`，而且 429 就直接丢）。现在落进同一道节流窗口。
+        polite_gap(1.5)
         r = _session.get("https://doi.org/" + doi, headers=_WEB_HDR,
                          timeout=timeout, allow_redirects=True)
+        # 429 / 5xx 时退避重试一次（原来直接放弃）
+        if r.status_code in (429, 500, 502, 503, 504):
+            _w = _parse_retry_after(r.headers.get("Retry-After")) or 5.0
+            print(f"    [限流] HTTP {r.status_code}，{_w:.0f}s 后重试一次")
+            time.sleep(min(_w, 30.0))
+            polite_gap(1.5)
+            r = _session.get("https://doi.org/" + doi, headers=_WEB_HDR,
+                             timeout=timeout, allow_redirects=True)
     except Exception:
         return ""
     if r.status_code != 200:
@@ -552,19 +669,28 @@ def fetch_abstract_from_web(doi, timeout=25):
     if len(html) < 8000 and ("captcha" in low or "are you a robot" in low
                              or "verify you are human" in low):
         return ""
-    for pat in WEB_META_PATTERNS:
+    def _clean(raw):
+        t = raw
+        t = t.replace("\\n", " ").replace("\\/", "/").replace('\\"', '"')
+        t = _html.unescape(t)              # ★ 反转义 &lt;p&gt; 之类
+        t = re.sub(r"<[^>]+>", " ", t)     # 去残留标签
+        t = _html.unescape(t)
+        t = re.sub(r"^\s*(?:Abstract|ABSTRACT|摘要)\s*[.．:：]?\s*", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        if len(t) < 120 or t.lower().startswith(
+                ("download", "share", "copyright", "view ")):
+            return ""
+        return t[:3000]
+
+    # ★ 只认 A/B 级。C 级（og:description / JSON-LD description）**不再当摘要** ——
+    #   那些常常是网站的自我介绍，喂给打分模型会凭空造出一个分数。
+    #   真需要的话调用方可以从返回的 "" 里意识到"没抓到"，而不是拿到脏数据。
+    for pat in WEB_META_PATTERNS_HIGH + WEB_META_PATTERNS_MID:
         m = re.search(pat, html, re.I | re.S)
         if m:
-            t = m.group(1)
-            t = t.replace("\\n", " ").replace("\\/", "/").replace('\\"', '"')
-            t = _html.unescape(t)              # ★ 反转义 &lt;p&gt; 之类
-            t = re.sub(r"<[^>]+>", " ", t)     # 去残留标签
-            t = _html.unescape(t)
-            t = re.sub(r"^\s*(?:Abstract|ABSTRACT|摘要)\s*[.．:：]?\s*", "", t)
-            t = re.sub(r"\s+", " ", t).strip()
-            if len(t) >= 120 and not t.lower().startswith(
-                    ("download", "share", "copyright", "view ")):
-                return t[:3000]
+            t = _clean(m.group(1))
+            if t:
+                return t
     return ""
 
 
@@ -692,6 +818,9 @@ def fetch_rss_with_retry(url, max_retries=3):
     session.headers.update(get_chrome_headers())
     for attempt in range(1, max_retries + 1):
         try:
+            # ★ 2026-10-01：RSS 原来自己建 Session、完全绕开统一限流器。
+            #   现在共用模块级的 polite_gap，总请求速率仍由那一道封顶。
+            polite_gap(1.0)
             print(f"  [尝试 {attempt}/{max_retries}] 正在请求 {url}")
             resp = session.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
@@ -721,6 +850,11 @@ def fetch_papers_from_rss():
     print("=" * 60)
 
     for url in RSS_SOURCES:
+        # ★ 2026-10-01：让 config.DEAD_RSS_BLACKLIST 真的生效（原来它也是死配置）。
+        #   现状下 RSS_SOURCES 里已无死源，这一句是防"以后又被加回来"。
+        if url in DEAD_RSS_BLACKLIST:
+            print(f"  [跳过] 已知死源：{url[:60]}")
+            continue
         name = infer_journal_name(url)
         print(f"\n[进度] 正在抓取 {name} ...")
         feed = fetch_rss_with_retry(url)
@@ -824,14 +958,9 @@ class OpenAlexFetcher:
         print("=" * 60)
 
         # 核心查询词（每个单独查询，OpenAlex 空格=AND 所以每个词尽量短）
-        queries = [
-            "landslide",
-            "slope stability",
-            "rainfall infiltration",
-            "preferential flow",
-            "debris flow",
-            "unsaturated soil",
-        ]
+        # ★ 2026-10-01：搬到 config.OPENALEX_QUERIES —— 别的源都能在 config 调，
+        #   唯独这里不能，很容易"以为改了配置其实没改"。
+        queries = list(OPENALEX_QUERIES)
 
         total_estimated = 0
         for q_idx, query in enumerate(queries, 1):
@@ -880,9 +1009,12 @@ class OpenAlexFetcher:
             # ★ 2026-10-01 新增：取真正的 OA PDF 直链（用于自动下载）
             best_oa = work.get("best_oa_location") or {}
             oa_info = work.get("open_access") or {}
-            oa_pdf_url = (best_oa.get("pdf_url") or
-                          oa_info.get("oa_url") or "").strip()
-            is_oa = bool(oa_info.get("is_oa")) or bool(oa_pdf_url)
+            # ★ 2026-10-01：同 `_oa_to_paper` —— PDF 直链与 OA 落地页分开取。
+            oa_pdf_url = (best_oa.get("pdf_url") or "").strip()
+            oa_landing_url = (oa_info.get("oa_url") or "").strip()
+            if not oa_landing_url:
+                oa_landing_url = (best_oa.get("landing_page_url") or "").strip()
+            is_oa = bool(oa_info.get("is_oa")) or bool(oa_pdf_url or oa_landing_url)
 
             # 提取摘要（OpenAlex 的 abstract_inverted_index）
             abstract = self._extract_abstract(work.get("abstract_inverted_index", {}))
@@ -912,7 +1044,8 @@ class OpenAlexFetcher:
             return pack(title=title, link=link, summary=abstract,
                         source=journal_name, data_source="OpenAlex",
                         doi=doi, authors=authors, year=pub_year,
-                        issn=issn_list, oa_pdf_url=oa_pdf_url, is_oa=is_oa,
+                        issn=issn_list, oa_pdf_url=oa_pdf_url,
+                        oa_landing_url=oa_landing_url, is_oa=is_oa,
                         extra={"openalex_id": openalex_url})
 
         except Exception as e:
