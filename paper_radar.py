@@ -97,8 +97,10 @@ def main():
     if USE_ARXIV:
         try:
             import sources as _src
-            all_papers.extend(_src.fetch_arxiv(
-                ['all:"preferential flow"', 'all:"slope stability"'], 60))
+            # ★ 2026-10-01：查询词移入 config.ARXIV_QUERIES ——
+            #   harvest.py 的同名函数原来漏了 arXiv 这一支，两处共用同一份配置
+            #   才能保证云端与本地抓到的是同一批。
+            all_papers.extend(_src.fetch_arxiv(ARXIV_QUERIES, ARXIV_PER_QUERY))
         except Exception as e:
             print(f"  [警告] arXiv 抓取失败：{e}")
 

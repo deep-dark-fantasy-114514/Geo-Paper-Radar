@@ -225,6 +225,11 @@ CROSSREF_QUERIES = [
 ]
 CROSSREF_ROWS = 200           # 每组查询取多少（Crossref 单次硬上限 1000）
 USE_ARXIV = False             # 预印本，地学覆盖小，默认关
+# ★ 2026-10-01：查询词从 paper_radar.py 里搬过来 —— 原来 harvest.py 的
+#   fetch_all_candidates() 是逐字拷贝的，却【漏掉了 arXiv 这一支】。
+#   两处共用同一份查询词，以后不会各改各的。
+ARXIV_QUERIES = ['all:"preferential flow"', 'all:"slope stability"']
+ARXIV_PER_QUERY = 60
 
 # ---- ★ 2026-10-01 新增：学位论文 + 中文核心刊 ----
 # 学位论文：OpenAlex 实测近 3 年 landslide rainfall 497 篇、preferential flow soil
@@ -258,19 +263,51 @@ ABSTRACT_ENRICH_WEB = 40        # 去出版社落地页抓几篇（每篇约 1.5
 HARVEST_DIR = os.path.join(BASE_DIR, "harvest")
 HARVEST_KEEP_DAYS = 14        # 本地只回捞最近 N 天的云端候选
 HARVEST_MAX = 600             # 云端每天最多存几篇（控制仓库体积）
-HARVEST_ABSTRACT_CHARS = 600  # 摘要截断长度
-                              # 体积估算：600 篇 × 约 1.1 KB ≈ 660 KB/天
-                              #           × 14 天 ≈ 9 MB（工作流会自动删 14 天前的）
+HARVEST_MIN_PER_SOURCE = 60   # ★ 2026-10-01 新增：每个来源【至少】保住几篇（不足则全留）
+                              #   由来：`kept[:HARVEST_MAX]` 是【按列表顺序】截断的，
+                              #   而学位论文 / 中文核心刊在 fetch_all_candidates()
+                              #   里是【最后追加】的 ⇒ 实测每天被整源砍光：
+                              #   48 篇学位论文 + 20 篇中文核心，一篇都进不了存档。
+HARVEST_ABSTRACT_CHARS = 2000 # ★ 2026-10-01：600 → 2000（原值把摘要砍掉大半）
+                              #   由来：本地打分按 summary[:2000] 喂模型
+                              #   （scoring.py:194 / local_scorer.py:243），
+                              #   云端却在 600 就截 ⇒ 模型永远看不到后半段。
+                              #   实测存档中有摘要的 188 篇里 160 篇被截，
+                              #   且常切在 "(i) temporal extraction," 这种要害处。
+                              #   代价：约 +300 KB/天（412/600 本就是 "No abstract"）。
+HARVEST_HTTP_TIMEOUT = 10     # 回捞单次超时（秒）。实测不通的镜像是在
+                              # 【建连阶段就秒失败】，不是等超时；10 s 只是兜底。
+HARVEST_NET_FAIL_TOLERANCE = 2  # 连续几天都取不回就判定「网络不通」并停止回捞
+                              # （镜像全灭时另有一条立即退出的路径）
 HARVEST_CONSUMED = os.path.join(BASE_DIR, ".harvest_consumed.json")
 
-# 仓库 raw 地址（仓库是公开的，无需 token）
-# ★ 原来是硬编码的。改成可用环境变量覆盖 —— 仓库改名/迁移/Fork 后
-#   只需设 PAPER_RADAR_REPO_RAW，不用改代码。默认值仍是本仓库。
-#   同时 harvest.merge_harvest() 会【记录失败原因】，不再静默跳过。
-REPO_RAW = os.getenv(
+# ── 仓库 raw 地址（仓库是公开的，无需 token）──────────────────────────
+# ★ 2026-10-01 实测：**raw.githubusercontent.com 在国内这条网上完全不可达**
+#   —— requests 直接抛 SSLError(UNEXPECTED_EOF_WHILE_READING)，这正是
+#   "回捞云端候选"这个功能一直没生效的根因（不是代码写错，是网到不了）。
+#   实测可达的替代通道（本机，2026-10-01）：
+#       gh-proxy.com   0.5 s   ✅
+#       api.github.com 0.6 s   ✅（但匿名限流 60 次/小时）
+#       ghproxy.net    1.1 s   ✅
+#       cdn.jsdelivr   3.0 s   ⚠ 对 @main 有 12 h 缓存，当天更新的文件取不到 ⇒ 不用
+#   因此改成【镜像链】，按顺序试，谁先通用谁；失败的当场剔除，本轮到尾
+#   不会再等它。可用 PAPER_RADAR_REPO_RAW 覆盖（逗号分隔多个即自定义镜像链；
+#   只给一个则不做回退）。
+#   ⚠ 顺序按【本机实测速度】排，raw 放最后：它是直连地址，只有在挂了代理/
+#     梯子时才通，否则每次都要白等一次超时。有 VPN 的把 PAPER_RADAR_REPO_RAW
+#     设成 raw 那个地址即可。
+_REPO_SLUG = "deep-dark-fantasy-114514/Geo-Paper-Radar"
+_REPO_BRANCH = "main"
+_GH_RAW = f"https://raw.githubusercontent.com/{_REPO_SLUG}/{_REPO_BRANCH}/harvest/"
+
+REPO_RAW_MIRRORS = [u.strip() for u in os.getenv(
     "PAPER_RADAR_REPO_RAW",
-    "https://raw.githubusercontent.com/"
-    "deep-dark-fantasy-114514/Geo-Paper-Radar/main/harvest/")
+    ",".join(["https://gh-proxy.com/" + _GH_RAW,      # 实测 0.5 s
+              "https://ghproxy.net/" + _GH_RAW,       # 实测 1.1 s
+              _GH_RAW])).split(",") if u.strip()]     # 直连（需代理）
+
+# 兼容旧名：仍指向【首选】地址
+REPO_RAW = REPO_RAW_MIRRORS[0]
 
 # ---- 杂项 ----
 FETCH_HOURS = 24         # RSS 抓取窗口（小时）

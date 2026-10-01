@@ -1,6 +1,8 @@
 .env
 __pycache__/
 *.pyc
+*.tmp         # 原子写的中间态（harvest/*.json.tmp、processed.json.tmp …）
+              # ★ harvest/ 是要提交的目录，不挡 .tmp 的话，写盘被杀会留下半截文件被提交
 
 # ---- 本地数据（只在本机存在，不进仓库）----
 EndNote_Watch/
@@ -8,8 +10,7 @@ Library/
 PDF_Inbox/
 .harvest_consumed.json
 processed.json
-processed.json.tmp
-*.bak_*
+*.bak*        # 含 .bak_ / .bak2_ / .bak3_ 等所有变体
 
 # 注意：harvest/ 必须【提交】——那是云端在笔记本睡着时攒下的候选，
 # 本机要靠 raw HTTP 回捞它。不要把它加进来。
