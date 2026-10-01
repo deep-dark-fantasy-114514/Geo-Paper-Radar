@@ -9,6 +9,8 @@ import json
 import time
 
 from config import *
+import local_scorer          # 打分提示词/归一化都在这里，两边共用
+
 
 
 def build_deepseek_prompt(title, abstract):
@@ -35,17 +37,45 @@ def build_deepseek_prompt(title, abstract):
     return system_prompt, user_prompt
 
 
-def score_paper_with_deepseek(title, abstract):
+_client = None
+
+
+def _get_client():
+    """★ 2026-10-01：客户端改为模块级单例。
+
+    原来每次打分都 `OpenAI(...)` 一次 —— 底层无法复用 HTTP 连接池，
+    每篇都要重做 TCP/TLS 握手，白白增加延迟。
+    """
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    return _client
+
+
+def score_paper_with_deepseek(title, abstract, retries=2):
     system_prompt, user_prompt = build_deepseek_prompt(title, abstract)
     try:
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_prompt}],
-            temperature=0.3,
-            max_tokens=300,
-        )
+        client = _get_client()
+        response = None
+        for _attempt in range(retries + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[{"role": "system", "content": system_prompt},
+                              {"role": "user", "content": user_prompt}],
+                    temperature=0.3,
+                    # ★ max_tokens 由 300 提到 700：reason/tldr 写长一点时，
+                    #   300 会把结尾的 } 截掉，json.loads 直接抛错丢文献。
+                    max_tokens=700,
+                    # ★ 强制 JSON 模式，比事后再找 { } 截取可靠得多
+                    response_format={"type": "json_object"},
+                )
+                break
+            except Exception as _e:
+                if _attempt >= retries:
+                    raise
+                print(f"  [重试] 第 {_attempt+1} 次失败（{type(_e).__name__}），稍后再试")
+                time.sleep(1.5 * (_attempt + 1))
         content = response.choices[0].message.content.strip()
         start = content.find("{")
         end = content.rfind("}")
@@ -60,7 +90,13 @@ def score_paper_with_deepseek(title, abstract):
                 raise ValueError(f"缺少字段: {field}")
         for dim in ["slope_stability", "rainfall_infiltration", "preferential_flow", "method_innovation"]:
             result[dim] = max(0, min(10, int(result[dim])))
-        result["total_score"] = max(0, min(40, int(result["total_score"])))
+        # ★ 2026-10-01：不再采信模型给的 total_score —— 大模型做多步精确加法
+        #   极易出错（四项 8+7+6+8 可能被写成 26 或 31），而双轨制筛选
+        #   （总分≥30 / 单项≥9）就靠这个数裁决。改为代码自己求和。
+        #   （local_scorer 一直是这么做的，这里是补齐一致性。）
+        result["total_score"] = sum(result[d] for d in
+            ["slope_stability", "rainfall_infiltration",
+             "preferential_flow", "method_innovation"])
         ts = result["total_score"]
         result["recommendation"] = "strong" if ts >= TOTAL_SCORE_PASS else ("normal" if ts >= BROWSING_THRESHOLD else "weak")
         result["score"] = round(result["total_score"] / 40 * 100)
@@ -75,6 +111,35 @@ def score_paper_with_deepseek(title, abstract):
     return None
 
 
+def score_titleonly_with_deepseek(title, retries=2):
+    """只有标题的论文：走【相关性二分类】，不套四维打分。
+
+    ★ 复用 `local_scorer` 的提示词与归一化函数，保证两条打分器行为**完全一致**
+      —— 否则换打分器后 `_title_only` 标签与简报分区就会失效。
+    """
+    prompt = local_scorer.build_prompt(title, "No abstract available")
+    try:
+        client = _get_client()
+        resp = None
+        for _attempt in range(retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1, max_tokens=300,
+                    response_format={"type": "json_object"})
+                break
+            except Exception:
+                if _attempt >= retries:
+                    raise
+                time.sleep(1.5 * (_attempt + 1))
+        raw = resp.choices[0].message.content.strip()
+        return local_scorer.normalize_titleonly(local_scorer.parse_json(raw))
+    except Exception as e:
+        print(f"  [Error] 相关性判断失败: {e}")
+        return None
+
+
 def score_all_papers(papers, phase_label="DeepSeek"):
     """对文献列表打分。
 
@@ -85,11 +150,9 @@ def score_all_papers(papers, phase_label="DeepSeek"):
         print("\n" + "=" * 60)
         print(f"【第二阶段】本地 Qwen3.5-9B 多维度打分（免费，共 {len(papers)} 篇）")
         print("=" * 60)
+        # ★ 2026-10-01：local_scorer 已在文件顶部静态导入（原来是运行时
+        #   改 sys.path 再自导入的补丁式写法）。
         try:
-            import sys as _sys
-            if BASE_DIR not in _sys.path:
-                _sys.path.insert(0, BASE_DIR)
-            import local_scorer
             scored = local_scorer.score_all(papers)
         except Exception as e:
             print(f"  [Error] 本地打分模块异常：{e}")
@@ -103,6 +166,21 @@ def score_all_papers(papers, phase_label="DeepSeek"):
                 p["score"] = round(ts / 40 * 100)
             return scored
         print("  [回退] 本地打分不可用，改用 DeepSeek")
+        # ★★★ 2026-10-01【安全熔断】★★★
+        #   main() 里的 _cap 是按【配置的 SCORER】算的：配成 local 时
+        #   MAX_CANDIDATES=None ⇒ 走"不截断"分支。可本地一旦挂掉就回退到这里，
+        #   收到的是【全部】几百上千篇 ⇒ MAX_DEEPSEEK_INPUT=40 的堤坝被完全绕过，
+        #   会直接产生高额 API 账单并阻塞数小时。
+        #   所以熔断必须做在这里 —— 判据是"实际要跑哪个打分器"，不是配置。
+        if len(papers) > MAX_DEEPSEEK_INPUT:
+            _n0 = len(papers)
+            try:
+                from filters import limit_for_deepseek
+                papers = limit_for_deepseek(papers, MAX_DEEPSEEK_INPUT)
+            except Exception:
+                papers = papers[:MAX_DEEPSEEK_INPUT]
+            print(f"  [安全熔断] 本地打分失效，回退 DeepSeek 前强制截断 "
+                  f"{_n0} → {len(papers)} 篇，防止费用失控")
 
     # ─────────────── 以下为原 DeepSeek 路径（保留作后备） ───────────────
     print("\n" + "=" * 60)
@@ -116,6 +194,23 @@ def score_all_papers(papers, phase_label="DeepSeek"):
         abstract = paper["summary"]
         source = paper.get("source", "?")
         print(f"\n[进度] ({idx}/{total}) 正在打分 [{source}]: {title[:60]}...")
+
+        # ★ 2026-10-01：只有标题的走【相关性二分类】，不硬套四维打分。
+        #   原来 DeepSeek 路径对所有文献一律四维评分 —— 让模型凭十来个单词的
+        #   英文标题去判"优先流机制/方法创新性"，必然幻觉；而且【不打 _title_only
+        #   标签】，主程序预设的"只标题文献走独立简报与待下载清单"就彻底失效，
+        #   导致换打分器后业务行为不一致。
+        if (not abstract) or str(abstract).startswith("No abstract"):
+            result = score_titleonly_with_deepseek(title)
+            if result is None:
+                print(f"  [跳过] 该篇相关性判断失败，已跳过")
+                continue
+            paper.update(result)
+            scored.append(paper)
+            print(f"  [只标题] {'相关' if result.get('relevant') else '不相关'}"
+                  f" | {result.get('reason', '')}")
+            time.sleep(0.3)
+            continue
 
         result = score_paper_with_deepseek(title, abstract)
         if result is None:
@@ -134,5 +229,4 @@ def score_all_papers(papers, phase_label="DeepSeek"):
 
 
 # ══════════════════════════════════════════════
-# 7. 模块五：双轨制筛选 + .ris + 邮件（V2.0 复用）
 # ══════════════════════════════════════════════
