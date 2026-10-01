@@ -684,7 +684,7 @@ if __name__ == "__main__":
 
 
 # ══════════════════════════════════════════════
-# 以下从 paper_radar.py 拆入（2026-10-01，逐字搬运，未改逻辑）
+# 8. RSS 抓取（2026-10-01 从 paper_radar.py 逐字拆入，未改逻辑）
 # ══════════════════════════════════════════════
 
 def fetch_rss_with_retry(url, max_retries=3):
@@ -759,7 +759,7 @@ def fetch_papers_from_rss():
 
 
 # ══════════════════════════════════════════════
-# 4. 模块二：OpenAlex 数据源（V3.0 新增）
+# 9. OpenAlex 搜索式抓取（同上，从 paper_radar.py 拆入）
 # ══════════════════════════════════════════════
 
 
@@ -931,8 +931,3 @@ class OpenAlexFetcher:
                 word_positions.append((pos, word))
         word_positions.sort(key=lambda x: x[0])
         return " ".join(word for _, word in word_positions)
-
-
-# ══════════════════════════════════════════════
-# 5. 模块三：两阶段过滤（V3.0 核心）
-# ══════════════════════════════════════════════
