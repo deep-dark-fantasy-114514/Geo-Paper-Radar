@@ -73,33 +73,34 @@ def build_prompt(title, abstract):
         f"{i}. {k}（{d}）0-10 分" for i, (k, d) in enumerate(DIMS, 1))
     no_ab = (not abstract) or abstract.startswith("No abstract")
     if no_ab:
-        # ★ 2026-10-01：闭源论文常拿不到摘要（Elsevier/Wiley 不交摘要给任何索引）。
-        #   这类【只看标题】的，要明确告诉模型"没有摘要是正常的，别因此拒答"，
-        #   并让它对不确定的给低分而不是猜。
+        # ★ 2026-10-01（用户定）：**只有标题的论文【不打分】**。
+        #   标题的信息量不足以支撑"四维 0-10 分"这种细粒度评分，硬打出来的分数不可信。
+        #   改为只做一个【相关 / 不相关】的二分类判断 —— 够用，且不误导后续筛选。
         return (
             f"{SYSTEM}\n\n"
-            f"下面这篇论文**只有标题，没有摘要**（闭源期刊未公开摘要），"
-            f"请**仅凭标题**判断它与【碎石土边坡优先流入渗】的相关程度。\n\n"
-            f"按四个维度打分（每维 0-10 整数）：\n{dims_txt}\n\n"
-            f"只有标题时的评分规则：\n"
-            f"- 标题里明确出现边坡/滑坡/降雨入渗/优先流/非饱和土/渗流的 ⇒ 给 5-8 分\n"
-            f"- 标题明显是本方向的常规研究（不含新意）⇒ 方法创新给 1-3 分\n"
-            f"- 标题与本方向**看不出关系**的 ⇒ **四个维度都给 0-1 分**，不要猜\n"
-            f"- ⚠️ 注意歧义词：'slope' 可能是电化学的 Tafel slope，"
-            f"'soil' 可能是土壤生态学，'flow' 可能是流体力学——"
-            f"这些【不是】我们方向的，给 0-1 分\n\n"
+            f"下面这篇论文**只有标题、没有摘要**（闭源期刊未公开摘要，属正常情况）。\n"
+            f"⚠️ **不要给它打四维分数** —— 标题信息量不足以支撑细粒度评分。\n"
+            f"只做一件事：**判断这个标题与上述研究主线是否相关**。\n\n"
+            f"判定为【相关】的情形：\n"
+            f"- 标题明确涉及 边坡稳定 / 滑坡 / 降雨入渗 / 优先流 / 非饱和土 / 渗流 / "
+            f"根系与植被的水文力学作用 / 区域尺度滑坡易发性 / 库岸边坡\n"
+            f"- 即使只是沾边（例如孔隙结构、土水特性），只要可能对本研究有参考价值就算相关\n\n"
+            f"判定为【不相关】的情形：\n"
+            f"- 标题与本方向看不出任何关系\n"
+            f"- ⚠️ 特别注意**歧义词**：'slope' 可能是电化学的 Tafel slope，"
+            f"'soil' 可能是土壤生态学/农学，'flow' 可能是流体力学/微流控，"
+            f"'landslide' 可能是地质灾害科普或旅游——这些【不相关】\n"
+            f"- 不确定时判**不相关**（宁可漏，不要用不确定的标题淹没你的清单）\n\n"
             f"【论文标题】{title}\n"
             f"【摘要】（无）\n\n"
             f"只输出 JSON，不要解释、不要 markdown 代码块：\n"
-            '{"slope_stability":<int>,"rainfall_infiltration":<int>,'
-            '"preferential_flow":<int>,"method_innovation":<int>,'
-            '"reason":"<20字以内中文理由；若判为无关就写 标题看不出相关性>",'
-            '"tldr":"<一句话>",'
+            '{"relevant":<true|false>,'
+            '"reason":"<15字以内中文理由>",'
             '"dual_role":"<adverse|beneficial|both|none>",'
             '"scale":"<pore|slope|catchment|regional|na>",'
             '"approach":"<numerical|experimental|theoretical|review|data-driven|na>"}'
             + _QUAL_SPEC
-            + "\n不要输出 total_score，我会自己加。"
+            + "\n⚠️ 再强调一次：不要输出四个维度分数，也不要输出 total_score。"
         )
     return (
         f"{SYSTEM}\n\n"
@@ -189,6 +190,27 @@ def normalize(raw):
     return out
 
 
+def normalize_titleonly(raw):
+    """★ 只有标题的论文：**只取「相关/不相关」，不打分**（用户 2026-10-01 定）。
+
+    标题信息量不足以支撑四维 0-10 的细粒度评分，硬打分只会误导后续筛选。
+    返回的记录里【没有 total_score】，但有 _title_only=True —— 下游据此分流。
+    """
+    if not isinstance(raw, dict) or "relevant" not in raw:
+        return None
+    v = raw.get("relevant")
+    if isinstance(v, str):
+        rel = v.strip().lower() in ("true", "yes", "y", "是", "1")
+    else:
+        rel = bool(v)
+    out = {"relevant": rel, "_title_only": True,
+           "reason": str(raw.get("reason", ""))[:60], "tldr": ""}
+    for f, spec in QUALITATIVE_FIELDS.items():
+        vv = str(raw.get(f, "")).strip().lower()
+        out[f] = vv if vv in spec["values"] else ("none" if f == "dual_role" else "na")
+    return out
+
+
 def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
     """对 papers 批量打分（原地更新每篇的字段）。
 
@@ -215,14 +237,20 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
     t0 = time.time()
     ok = fail = 0
     try:
+        n_title_only = 0
         for idx, p in enumerate(papers, 1):
             title = p.get("title", "")
-            abstract = p.get("summary", "") or "No abstract available"
+            abstract = p.get("summary", "") or ""
+            # ★ 只有标题的走【相关性判断】，不打分（用户 2026-10-01 定）
+            title_only = (not abstract) or abstract.startswith("No abstract")
+            if title_only:
+                n_title_only += 1
             res = None
             for attempt in range(max_retries):
                 try:
                     raw = _call_text(ai, build_prompt(title, abstract))
-                    res = normalize(parse_json(raw))
+                    res = (normalize_titleonly(parse_json(raw)) if title_only
+                           else normalize(parse_json(raw)))
                     if res:
                         break
                 except Exception:
@@ -236,14 +264,21 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
                 el = time.time() - t0
                 eta = el / idx * (total - idx)
                 print(f"  [本地打分] {idx}/{total}  成功 {ok} 失败 {fail}  "
+                      f"（其中只标题 {n_title_only} 篇，不打分）  "
                       f"已用 {el:.0f}s  预计剩余 {eta:.0f}s")
     finally:
         ai.stop_server()
 
     el = time.time() - t0
+    n_scored = sum(1 for p in papers if "total_score" in p)
+    n_rel = sum(1 for p in papers if p.get("_title_only") and p.get("relevant"))
     print(f"  [汇总] 本地打分完成：成功 {ok}/{total} 篇，耗时 {el:.0f}s "
           f"（{el/max(total,1):.2f} s/篇）")
-    return [p for p in papers if "total_score" in p]
+    print(f"        其中【有摘要·打过四维分】{n_scored} 篇；"
+          f"【只标题·不打分】{n_title_only} 篇（判为相关 {n_rel} 篇）")
+    # 有分的、或只标题但判为相关的，都留下交给下游
+    return [p for p in papers if "total_score" in p
+            or (p.get("_title_only") and p.get("relevant"))]
 
 
 # --------------------------------------------------------------- 自测

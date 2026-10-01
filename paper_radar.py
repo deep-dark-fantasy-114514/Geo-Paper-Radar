@@ -231,8 +231,18 @@ def main():
         print("\n[结果] DeepSeek 打分全部失败，任务结束")
         return
 
-    # C2: 双轨制筛选
-    pass_list, browsing_list = dual_track_filter(scored_papers)
+    # C1.5: ★ 把「只有标题·未打分」的挑出来（用户 2026-10-01 定）
+    #   标题信息量不足以支撑四维细粒度评分，硬打分只会误导筛选。
+    #   这些篇只做了【相关/不相关】二分类，不进双轨制，单独走简报 + 待下载清单。
+    titleonly_list = [p for p in scored_papers
+                      if p.get("_title_only") and p.get("relevant")]
+    scored_only = [p for p in scored_papers if not p.get("_title_only")]
+    if titleonly_list:
+        print(f"\n  [只标题·未打分] {len(titleonly_list)} 篇判为相关 —— "
+              f"不进双轨制，改走简报与待下载清单，供你人工判断")
+
+    # C2: 双轨制筛选（只对【打过四维分】的做）
+    pass_list, browsing_list = dual_track_filter(scored_only)
 
     # ★ 2026-10-01：把打过分的一律登记（不管分高分低），下次不再重复打分
     try:
@@ -297,8 +307,8 @@ def main():
             _sys.path.insert(0, BASE_DIR)
         import library_manager as _lm2
         _lm2.ensure_dirs()
-        dl_csv, dl_n = _lm2.build_download_list(pass_list + browsing_list,
-                                                filed_keys)
+        dl_csv, dl_n = _lm2.build_download_list(
+            pass_list + browsing_list + titleonly_list, filed_keys)
         if dl_csv:
             # ★ 登记为 listed，避免同一篇明天又被列一次
             try:
@@ -328,7 +338,8 @@ def main():
         _lm.ensure_dirs()
         digest_path = _lm.build_digest(pass_list, browsing_list,
                                        len(scored_papers),
-                                       time.time() - start_time)
+                                       time.time() - start_time,
+                                       titleonly=titleonly_list)
         print(f"\n📋 文献简报：{digest_path}")
     except Exception as e:
         print(f"\n[警告] 简报生成失败：{type(e).__name__}: {e}")

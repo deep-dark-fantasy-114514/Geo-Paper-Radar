@@ -130,7 +130,8 @@ def file_paper(pdf, paper, ai=None, rn=None, template=DEFAULT_TEMPLATE,
     return dst, cat
 
 
-def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None):
+def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None,
+                 titleonly=None):
     """生成 Markdown 文献简报。返回文件路径。"""
     date_str = date_str or time.strftime("%Y-%m-%d")
     os.makedirs(DIGEST_DIR, exist_ok=True)
@@ -194,6 +195,29 @@ def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None)
         for i, p in enumerate(browsing_list, 1):
             L.append(row(p, i))
 
+    # ★ 2026-10-01：只有标题的论文【不打分】，单独一节供人工判断
+    if titleonly:
+        L.append("\n## 只有标题 · 未打分（闭源未公开摘要，仅做了相关性判断）\n")
+        L.append(f"共 **{len(titleonly)}** 篇被判为与本方向相关。"
+                 f"它们**没有四维分数**——标题信息量不足以支撑细粒度评分。"
+                 f"已一并进入「待下载清单」，可手动取回后再判断。\n")
+        L.append("| # | 作用 | 尺度 | 方法 | 标题 | 原文 | 来源 |")
+        L.append("|---|------|------|------|------|------|------|")
+        for i, p in enumerate(titleonly, 1):
+            _r = {"adverse": "**不利**", "beneficial": "有利",
+                  "both": "两面", "none": "—"}.get(p.get("dual_role", "none"), "—")
+            _s = {"pore": "孔隙", "slope": "边坡", "catchment": "流域",
+                  "regional": "区域"}.get(p.get("scale", "na"), "—")
+            _a = {"numerical": "数值", "experimental": "实验", "theoretical": "理论",
+                  "review": "综述", "data-driven": "数据"}.get(
+                      p.get("approach", "na"), "—")
+            L.append(f"| {i} | {_r} | {_s} | {_a} | {p.get('title','')} | "
+                     f"[链接]({p.get('link','')}) | {p.get('source','')} |")
+        L.append("\n### 判定理由\n")
+        for i, p in enumerate(titleonly, 1):
+            L.append(f"- **{i}.** {p.get('title','')[:110]}")
+            L.append(f"  - {p.get('reason','')}")
+
     with io.open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
     return path
@@ -254,7 +278,8 @@ def build_download_list(papers, already_filed_keys, date_str=None):
                 p.get("year", ""),
                 p.get("source", ""),
                 pick_category(p),
-                p.get("total_score", 0),
+                # ★ 只有标题的没打过分，用标记代替数字，别让 0 被误读成"很不相关"
+                ("仅标题" if p.get("_title_only") else p.get("total_score", 0)),
                 p.get("reason", ""),
                 "无" if has_no_abstract(p) else "有",
                 p.get("link", ""),
@@ -269,7 +294,8 @@ def build_download_list(papers, already_filed_keys, date_str=None):
     for i, p in enumerate(todo, 1):
         doi = (p.get("doi") or "").replace("https://doi.org/", "")
         has_ab = not has_no_abstract(p)
-        L.append(f"| {i} | {p.get('total_score',0)} | {pick_category(p)} | "
+        _sc = "**仅标题**" if p.get("_title_only") else p.get("total_score", 0)
+        L.append(f"| {i} | {_sc} | {pick_category(p)} | "
                  f"{p.get('title','')} | `{doi}` | {'有' if has_ab else '**无**'} | "
                  f"[链接]({p.get('link','')}) |")
     with io.open(md_path, "w", encoding="utf-8") as f:
