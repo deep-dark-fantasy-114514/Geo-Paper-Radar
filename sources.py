@@ -269,8 +269,12 @@ def fetch_crossref_journals(journals=None, days=7, rows=200):
 # ══════════════════════════════════════════════
 # 3b. OpenAlex 学位论文（硕博）★ 2026-10-01 新增
 # ══════════════════════════════════════════════
-def _oa_to_paper(w):
-    """OpenAlex work → 统一格式（与 paper_radar._parse_work 一致的字段）。"""
+def _oa_to_paper(w, tag="OpenAlex"):
+    """OpenAlex work → 统一格式（与 paper_radar._parse_work 一致的字段）。
+
+    tag 用于区分来源子类：期刊论文 / 学位论文(OpenAlex-Diss) / 中文核心刊(OpenAlex-CN)，
+    这样在有日报里能一眼看出各源贡献了多少。
+    """
     title = w.get("title")
     if not title:
         return None
@@ -292,7 +296,7 @@ def _oa_to_paper(w):
     auth = [((a.get("author") or {}).get("display_name") or "")
             for a in (w.get("authorships") or [])][:10]
     return pack(title=title, link=doi or w.get("id") or "", summary=ab,
-                source=src, data_source="OpenAlex",
+                source=src, data_source=tag,
                 doi=doi, authors=[a for a in auth if a],
                 year=w.get("publication_year"),
                 issn=(((pl.get("source") or {}).get("issn")) or []),
@@ -319,7 +323,7 @@ def fetch_openalex_dissertations(queries, days=365, per_query=60, max_total=200)
                                "per-page": min(per_query, 200),
                                "sort": "publication_date:desc",
                                "mailto": MAILTO}, min_gap=1.0)
-        got = [p for p in (_oa_to_paper(w)
+        got = [p for p in (_oa_to_paper(w, tag="OpenAlex-Diss")
                            for w in ((d or {}).get("results") or [])) if p]
         ab = sum(1 for p in got if p["summary"] != "No abstract available")
         print(f"    取到 {len(got)} 篇（有摘要 {ab}）")
@@ -361,7 +365,7 @@ def fetch_openalex_journals(issns=None, days=90, per_journal=60, max_total=200):
                                "per-page": min(per_journal, 200),
                                "sort": "publication_date:desc",
                                "mailto": MAILTO}, min_gap=1.0)
-        got = [p for p in (_oa_to_paper(w)
+        got = [p for p in (_oa_to_paper(w, tag="OpenAlex-CN")
                            for w in ((d or {}).get("results") or [])) if p]
         print(f"    取到 {len(got)} 篇")
         out.extend(got)

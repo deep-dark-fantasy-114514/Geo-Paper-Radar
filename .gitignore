@@ -7,6 +7,8 @@ EndNote_Watch/
 Library/
 PDF_Inbox/
 .harvest_consumed.json
+processed.json
+processed.json.tmp
 *.bak_*
 
 # 注意：harvest/ 必须【提交】——那是云端在笔记本睡着时攒下的候选，
