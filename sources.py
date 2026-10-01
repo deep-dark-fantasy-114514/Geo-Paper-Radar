@@ -26,15 +26,21 @@ sources.py —— 统一的文献检索源（2026-10-01 新增）
   `mailto` 参数进"礼貌池"（配额更宽），Semantic Scholar 官方建议 ≤1 req/s。
   照做既能拿到更全的结果，也不会给别人添麻烦。
 """
+import hashlib
 import html as _html
+import traceback
 import io
 import json
 import os
+import random
 import re
 import sys
 import time
 import urllib.parse
 
+import feedparser
+
+from config import *   # 常量（RSS_SOURCES / OPENALEX_* / CHINESE_JOURNALS_ISSN 等）与工具函数
 import requests
 
 try:
@@ -93,9 +99,12 @@ def polite_get(url, params=None, timeout=45, retries=4, base_delay=1.5,
     · 每次调用之间至少隔 min_gap 秒（默认 1 s，Semantic Scholar 的官方建议）
     · 返回解析后的 JSON，失败返回 None（调用方自己决定怎么办，不抛异常打断整批）
     """
+    # ★ 礼貌间隔：_last_call 是【模块级共享】的 ⇒ 所有源串行，
+    #   总请求速率被这一道统一封顶（默认 1 次/秒），不会对任何一家形成压力。
+    #   再叠一个 ±20% 抖动，避免规律性的整点突发。
     gap = time.time() - _last_call[0]
     if gap < min_gap:
-        time.sleep(min_gap - gap)
+        time.sleep(min_gap - gap + random.uniform(0, min_gap * 0.2))
     delay = base_delay
     for attempt in range(1, retries + 1):
         try:
@@ -479,7 +488,7 @@ def enrich_abstracts(papers, max_lookups=120):
     for i, p in enumerate(todo, 1):
         d = polite_get("https://api.crossref.org/works/" +
                        urllib.parse.quote(p["doi"]),
-                       params={"mailto": MAILTO}, min_gap=0.4, retries=2)
+                       params={"mailto": MAILTO}, min_gap=1.0, retries=2)
         ab = ((d or {}).get("message") or {}).get("abstract", "")
         if ab:
             p["summary"] = strip_jats(ab)
@@ -638,3 +647,543 @@ def _test():
 
 if __name__ == "__main__":
     sys.exit(_test())
+
+
+# ══════════════════════════════════════════════
+# 以下从 paper_radar.py 拆入（2026-10-01，逐字搬运，未改逻辑）
+# ══════════════════════════════════════════════
+
+def fetch_rss_with_retry(url, max_retries=3):
+    session = requests.Session()
+    session.headers.update(get_chrome_headers())
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"  [尝试 {attempt}/{max_retries}] 正在请求 {url}")
+            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+            if feed.bozo and not feed.entries:
+                print(f"  [Warning] RSS 解析异常: {feed.bozo_exception}")
+                continue
+            return feed
+        except requests.exceptions.Timeout:
+            print(f"  [Warning] 请求超时（尝试 {attempt}/{max_retries}）")
+        except requests.exceptions.RequestException as e:
+            print(f"  [Warning] 请求失败: {e}（尝试 {attempt}/{max_retries}）")
+        except Exception as e:
+            print(f"  [Warning] 未知错误: {e}（尝试 {attempt}/{max_retries}）")
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            print(f"  [Info] 等待 {wait}s 后重试...")
+            time.sleep(wait)
+    return None
+
+
+def fetch_papers_from_rss():
+    """RSS 抓取，返回 list[dict]"""
+    all_papers = []
+    print("=" * 60)
+    print("【RSS 源】文献抓取")
+    print("=" * 60)
+
+    for url in RSS_SOURCES:
+        name = infer_journal_name(url)
+        print(f"\n[进度] 正在抓取 {name} ...")
+        feed = fetch_rss_with_retry(url)
+        if feed is None or not feed.entries:
+            print(f"  [Warning] 跳过 {name}：抓取失败或无有效条目")
+            continue
+        count = 0
+        for entry in feed.entries:
+            if not is_within_hours(entry, FETCH_HOURS):
+                continue
+            title = entry.get("title", "").strip()
+            link = entry.get("link", "").strip()
+            summary = entry.get("summary", "") or entry.get("description", "") or ""
+            if not title:
+                continue
+            all_papers.append({
+                "title": title,
+                "link": link,
+                "summary": summary,
+                "source": name,
+                "data_source": "RSS",
+            })
+            count += 1
+        print(f"  [完成] {name}: 获取 {count} 篇新文献")
+
+    # 标题去重
+    seen = set()
+    unique = []
+    for p in all_papers:
+        t = p["title"].strip().lower()
+        if t not in seen:
+            seen.add(t)
+            unique.append(p)
+    print(f"\n[汇总] RSS 共抓取 {len(all_papers)} 篇，去重后 {len(unique)} 篇")
+    return unique
+
+
+# ══════════════════════════════════════════════
+# 4. 模块二：OpenAlex 数据源（V3.0 新增）
+# ══════════════════════════════════════════════
+
+
+class OpenAlexFetcher:
+    """
+    OpenAlex API 文献抓取器（方案B：纯文本搜索，无 concept_id 硬限制）
+    """
+
+    def __init__(self, mailto):
+        self.mailto = mailto
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64 x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        })
+
+    def _build_search_url(self, query, page=1):
+        """用单个关键词构造 OpenAlex 查询"""
+        from_date = (datetime.now() - timedelta(days=OPENALEX_DAYS_LOOKBACK)).strftime("%Y-%m-%d")
+        params = {
+            "filter": f"from_publication_date:{from_date}",
+            # 使用 title_and_abstract.search 限定在标题和摘要中搜索
+            "search": query,
+            "sort": "publication_date:desc",
+            "per_page": OPENALEX_PER_PAGE,
+            "page": page,
+            "mailto": self.mailto,
+        }
+        return f"{OPENALEX_BASE_URL}/works?{urllib.parse.urlencode(params)}"
+
+    def _fetch_single_query(self, query):
+        """执行单个关键词查询并解析结果。
+
+        ★ 2026-10-01 修：原来用裸 `requests.get`，**完全没有退避重试** ——
+        实测 OpenAlex 一限流就把 6 组查询全打成 0 篇，**910 篇覆盖悄无声息地没了**。
+        现在改走 `sources.polite_get()`：指数退避 + 读 Retry-After + 查询间隔 ≥1s。
+        """
+        url = self._build_search_url(query)
+        try:
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            import sources as _src
+            data = _src.polite_get(url, min_gap=1.0, retries=5)
+            if data is None:
+                return [], 0
+            papers = []
+            for work in data.get("results", []):
+                paper = self._parse_work(work)
+                if paper:
+                    papers.append(paper)
+            return papers, (data.get("meta") or {}).get("count", 0)
+        except Exception as e:
+            print(f"  [Warning] 查询 '{query[:20]}' 失败: {e}")
+            return [], 0
+
+    def fetch_papers(self):
+        """
+        从 OpenAlex 抓取文献 — 多关键词分次查询后合并
+        策略：用 6 个核心英文词分别查询，合并去重
+        目的：避免 AND 逻辑太重导致空结果
+        """
+        all_papers = []
+        print("\n" + "=" * 60)
+        print("【OpenAlex 源】大规模文献检索（方案B：多关键词分次查询）")
+        print("=" * 60)
+
+        # 核心查询词（每个单独查询，OpenAlex 空格=AND 所以每个词尽量短）
+        queries = [
+            "landslide",
+            "slope stability",
+            "rainfall infiltration",
+            "preferential flow",
+            "debris flow",
+            "unsaturated soil",
+        ]
+
+        total_estimated = 0
+        for q_idx, query in enumerate(queries, 1):
+            print(f"\n[进度] 查询 ({q_idx}/{len(queries)}): '{query}'")
+            papers, count = self._fetch_single_query(query)
+            total_estimated += count
+            if papers:
+                for p in papers:
+                    # 标记具体由哪个关键词命中
+                    p["openalex_query"] = query
+                all_papers.extend(papers)
+            print(f"  [完成] 获取 {len(papers)} 篇（OpenAlex 估计 {count} 篇）")
+
+        # 全局去重（按标题）
+        seen_titles = set()
+        unique_papers = []
+        for p in all_papers:
+            t = p["title"].strip().lower()
+            if t and t not in seen_titles:
+                seen_titles.add(t)
+                unique_papers.append(p)
+
+        print(f"\n[汇总] 多查询合并: {len(all_papers)} 篇 → 去重后 {len(unique_papers)} 篇")
+        print(f"  [估计] OpenAlex 总结果数约 {total_estimated} 篇（含跨查询重复）")
+        return unique_papers
+
+    def _parse_work(self, work):
+        """
+        解析单篇 OpenAlex work 对象，转换为统一格式
+        """
+        try:
+            title = work.get("title", "").strip()
+            if not title:
+                return None
+
+            # 提取 DOI / URL
+            # ★ 2026-10-01 更正：原变量名 pdf_url 名不副实——它取的其实是
+            #   【落地页】(landing_page_url)，从来不是 PDF 直链。已改名避免误解。
+            doi = work.get("doi", "") or ""
+            openalex_url = work.get("id", "") or ""
+            primary_location = work.get("primary_location", {}) or {}
+            landing_url = primary_location.get("landing_page_url", "") or ""
+
+            link = doi or landing_url or openalex_url
+
+            # ★ 2026-10-01 新增：取真正的 OA PDF 直链（用于自动下载）
+            best_oa = work.get("best_oa_location") or {}
+            oa_info = work.get("open_access") or {}
+            oa_pdf_url = (best_oa.get("pdf_url") or
+                          oa_info.get("oa_url") or "").strip()
+            is_oa = bool(oa_info.get("is_oa")) or bool(oa_pdf_url)
+
+            # 提取摘要（OpenAlex 的 abstract_inverted_index）
+            abstract = self._extract_abstract(work.get("abstract_inverted_index", {}))
+
+            # 提取期刊信息
+            source_obj = primary_location.get("source", {}) or {}
+            journal_name = source_obj.get("display_name", "") or "Unknown"
+            issn_list = source_obj.get("issn", []) or []
+
+            # 提取作者
+            authorships = work.get("authorships", []) or []
+            authors = []
+            for a in authorships[:10]:
+                author_obj = a.get("author", {}) or {}
+                name = author_obj.get("display_name", "")
+                if name:
+                    authors.append(name)
+
+            # 提取年份
+            pub_year = work.get("publication_year", datetime.now().year)
+
+            # 检查是否为中文核心期刊
+            is_chinese = any(issn.strip() in CHINESE_JOURNALS_ISSN for issn in issn_list)
+
+            return {
+                "title": title,
+                "link": link,
+                "summary": abstract or "No abstract available",
+                "source": journal_name,
+                "data_source": "OpenAlex",
+                "doi": doi,
+                "authors": authors,
+                "year": pub_year,
+                "issn": issn_list,
+                "is_chinese_journal": is_chinese,
+                "openalex_id": openalex_url,
+                "oa_pdf_url": oa_pdf_url,     # ★ 新增：OA PDF 直链（可为空）
+                "is_oa": is_oa,               # ★ 新增：是否开放获取
+            }
+
+        except Exception as e:
+            print(f"  [Warning] 解析 OpenAlex 条目失败: {e}")
+            return None
+
+    @staticmethod
+    def _extract_abstract(inverted_index):
+        """将 OpenAlex 的倒排索引摘要还原为纯文本"""
+        if not inverted_index:
+            return ""
+        # 按位置排序
+        word_positions = []
+        for word, positions in inverted_index.items():
+            for pos in positions:
+                word_positions.append((pos, word))
+        word_positions.sort(key=lambda x: x[0])
+        return " ".join(word for _, word in word_positions)
+
+
+# ══════════════════════════════════════════════
+# 5. 模块三：两阶段过滤（V3.0 核心）
+# ══════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════
+# 以下从 paper_radar.py 拆入（2026-10-01，逐字搬运，未改逻辑）
+# ══════════════════════════════════════════════
+
+def fetch_rss_with_retry(url, max_retries=3):
+    session = requests.Session()
+    session.headers.update(get_chrome_headers())
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"  [尝试 {attempt}/{max_retries}] 正在请求 {url}")
+            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+            if feed.bozo and not feed.entries:
+                print(f"  [Warning] RSS 解析异常: {feed.bozo_exception}")
+                continue
+            return feed
+        except requests.exceptions.Timeout:
+            print(f"  [Warning] 请求超时（尝试 {attempt}/{max_retries}）")
+        except requests.exceptions.RequestException as e:
+            print(f"  [Warning] 请求失败: {e}（尝试 {attempt}/{max_retries}）")
+        except Exception as e:
+            print(f"  [Warning] 未知错误: {e}（尝试 {attempt}/{max_retries}）")
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            print(f"  [Info] 等待 {wait}s 后重试...")
+            time.sleep(wait)
+    return None
+
+
+def fetch_papers_from_rss():
+    """RSS 抓取，返回 list[dict]"""
+    all_papers = []
+    print("=" * 60)
+    print("【RSS 源】文献抓取")
+    print("=" * 60)
+
+    for url in RSS_SOURCES:
+        name = infer_journal_name(url)
+        print(f"\n[进度] 正在抓取 {name} ...")
+        feed = fetch_rss_with_retry(url)
+        if feed is None or not feed.entries:
+            print(f"  [Warning] 跳过 {name}：抓取失败或无有效条目")
+            continue
+        count = 0
+        for entry in feed.entries:
+            if not is_within_hours(entry, FETCH_HOURS):
+                continue
+            title = entry.get("title", "").strip()
+            link = entry.get("link", "").strip()
+            summary = entry.get("summary", "") or entry.get("description", "") or ""
+            if not title:
+                continue
+            all_papers.append({
+                "title": title,
+                "link": link,
+                "summary": summary,
+                "source": name,
+                "data_source": "RSS",
+            })
+            count += 1
+        print(f"  [完成] {name}: 获取 {count} 篇新文献")
+
+    # 标题去重
+    seen = set()
+    unique = []
+    for p in all_papers:
+        t = p["title"].strip().lower()
+        if t not in seen:
+            seen.add(t)
+            unique.append(p)
+    print(f"\n[汇总] RSS 共抓取 {len(all_papers)} 篇，去重后 {len(unique)} 篇")
+    return unique
+
+
+# ══════════════════════════════════════════════
+# 4. 模块二：OpenAlex 数据源（V3.0 新增）
+# ══════════════════════════════════════════════
+
+
+class OpenAlexFetcher:
+    """
+    OpenAlex API 文献抓取器（方案B：纯文本搜索，无 concept_id 硬限制）
+    """
+
+    def __init__(self, mailto):
+        self.mailto = mailto
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64 x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        })
+
+    def _build_search_url(self, query, page=1):
+        """用单个关键词构造 OpenAlex 查询"""
+        from_date = (datetime.now() - timedelta(days=OPENALEX_DAYS_LOOKBACK)).strftime("%Y-%m-%d")
+        params = {
+            "filter": f"from_publication_date:{from_date}",
+            # 使用 title_and_abstract.search 限定在标题和摘要中搜索
+            "search": query,
+            "sort": "publication_date:desc",
+            "per_page": OPENALEX_PER_PAGE,
+            "page": page,
+            "mailto": self.mailto,
+        }
+        return f"{OPENALEX_BASE_URL}/works?{urllib.parse.urlencode(params)}"
+
+    def _fetch_single_query(self, query):
+        """执行单个关键词查询并解析结果。
+
+        ★ 2026-10-01 修：原来用裸 `requests.get`，**完全没有退避重试** ——
+        实测 OpenAlex 一限流就把 6 组查询全打成 0 篇，**910 篇覆盖悄无声息地没了**。
+        现在改走 `sources.polite_get()`：指数退避 + 读 Retry-After + 查询间隔 ≥1s。
+        """
+        url = self._build_search_url(query)
+        try:
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            import sources as _src
+            data = _src.polite_get(url, min_gap=1.0, retries=5)
+            if data is None:
+                return [], 0
+            papers = []
+            for work in data.get("results", []):
+                paper = self._parse_work(work)
+                if paper:
+                    papers.append(paper)
+            return papers, (data.get("meta") or {}).get("count", 0)
+        except Exception as e:
+            print(f"  [Warning] 查询 '{query[:20]}' 失败: {e}")
+            return [], 0
+
+    def fetch_papers(self):
+        """
+        从 OpenAlex 抓取文献 — 多关键词分次查询后合并
+        策略：用 6 个核心英文词分别查询，合并去重
+        目的：避免 AND 逻辑太重导致空结果
+        """
+        all_papers = []
+        print("\n" + "=" * 60)
+        print("【OpenAlex 源】大规模文献检索（方案B：多关键词分次查询）")
+        print("=" * 60)
+
+        # 核心查询词（每个单独查询，OpenAlex 空格=AND 所以每个词尽量短）
+        queries = [
+            "landslide",
+            "slope stability",
+            "rainfall infiltration",
+            "preferential flow",
+            "debris flow",
+            "unsaturated soil",
+        ]
+
+        total_estimated = 0
+        for q_idx, query in enumerate(queries, 1):
+            print(f"\n[进度] 查询 ({q_idx}/{len(queries)}): '{query}'")
+            papers, count = self._fetch_single_query(query)
+            total_estimated += count
+            if papers:
+                for p in papers:
+                    # 标记具体由哪个关键词命中
+                    p["openalex_query"] = query
+                all_papers.extend(papers)
+            print(f"  [完成] 获取 {len(papers)} 篇（OpenAlex 估计 {count} 篇）")
+
+        # 全局去重（按标题）
+        seen_titles = set()
+        unique_papers = []
+        for p in all_papers:
+            t = p["title"].strip().lower()
+            if t and t not in seen_titles:
+                seen_titles.add(t)
+                unique_papers.append(p)
+
+        print(f"\n[汇总] 多查询合并: {len(all_papers)} 篇 → 去重后 {len(unique_papers)} 篇")
+        print(f"  [估计] OpenAlex 总结果数约 {total_estimated} 篇（含跨查询重复）")
+        return unique_papers
+
+    def _parse_work(self, work):
+        """
+        解析单篇 OpenAlex work 对象，转换为统一格式
+        """
+        try:
+            title = work.get("title", "").strip()
+            if not title:
+                return None
+
+            # 提取 DOI / URL
+            # ★ 2026-10-01 更正：原变量名 pdf_url 名不副实——它取的其实是
+            #   【落地页】(landing_page_url)，从来不是 PDF 直链。已改名避免误解。
+            doi = work.get("doi", "") or ""
+            openalex_url = work.get("id", "") or ""
+            primary_location = work.get("primary_location", {}) or {}
+            landing_url = primary_location.get("landing_page_url", "") or ""
+
+            link = doi or landing_url or openalex_url
+
+            # ★ 2026-10-01 新增：取真正的 OA PDF 直链（用于自动下载）
+            best_oa = work.get("best_oa_location") or {}
+            oa_info = work.get("open_access") or {}
+            oa_pdf_url = (best_oa.get("pdf_url") or
+                          oa_info.get("oa_url") or "").strip()
+            is_oa = bool(oa_info.get("is_oa")) or bool(oa_pdf_url)
+
+            # 提取摘要（OpenAlex 的 abstract_inverted_index）
+            abstract = self._extract_abstract(work.get("abstract_inverted_index", {}))
+
+            # 提取期刊信息
+            source_obj = primary_location.get("source", {}) or {}
+            journal_name = source_obj.get("display_name", "") or "Unknown"
+            issn_list = source_obj.get("issn", []) or []
+
+            # 提取作者
+            authorships = work.get("authorships", []) or []
+            authors = []
+            for a in authorships[:10]:
+                author_obj = a.get("author", {}) or {}
+                name = author_obj.get("display_name", "")
+                if name:
+                    authors.append(name)
+
+            # 提取年份
+            pub_year = work.get("publication_year", datetime.now().year)
+
+            # 检查是否为中文核心期刊
+            is_chinese = any(issn.strip() in CHINESE_JOURNALS_ISSN for issn in issn_list)
+
+            return {
+                "title": title,
+                "link": link,
+                "summary": abstract or "No abstract available",
+                "source": journal_name,
+                "data_source": "OpenAlex",
+                "doi": doi,
+                "authors": authors,
+                "year": pub_year,
+                "issn": issn_list,
+                "is_chinese_journal": is_chinese,
+                "openalex_id": openalex_url,
+                "oa_pdf_url": oa_pdf_url,     # ★ 新增：OA PDF 直链（可为空）
+                "is_oa": is_oa,               # ★ 新增：是否开放获取
+            }
+
+        except Exception as e:
+            print(f"  [Warning] 解析 OpenAlex 条目失败: {e}")
+            return None
+
+    @staticmethod
+    def _extract_abstract(inverted_index):
+        """将 OpenAlex 的倒排索引摘要还原为纯文本"""
+        if not inverted_index:
+            return ""
+        # 按位置排序
+        word_positions = []
+        for word, positions in inverted_index.items():
+            for pos in positions:
+                word_positions.append((pos, word))
+        word_positions.sort(key=lambda x: x[0])
+        return " ".join(word for _, word in word_positions)
+
+
+# ══════════════════════════════════════════════
+# 5. 模块三：两阶段过滤（V3.0 核心）
+# ══════════════════════════════════════════════
