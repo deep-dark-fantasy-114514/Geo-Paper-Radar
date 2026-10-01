@@ -16,6 +16,21 @@ def _no_abstract(paper):
     return (not s) or s.startswith("No abstract")
 
 
+
+# 期刊事务性内容（这类东西没有摘要、标题也不含研究关键词，混进来纯属浪费）
+_MATTER_RE = re.compile(
+    r"(erratum|corrigendum|retraction|expression of concern|"
+    r"editorial board|editorial\b|call for papers|table of contents|"
+    r"front matter|back matter|issue information|author index|subject index|"
+    r"volume index|annual index|preface|list of reviewers|"
+    r"勘误|更正|撤稿|编委|征稿|启事|目录|索引|会议通知)", re.I)
+
+
+def _looks_like_matter(title):
+    """判断标题是不是期刊事务性内容（勘误/编委会/目录/征稿…）。"""
+    return bool(_MATTER_RE.search(title or ""))
+
+
 def local_regex_coarse_filter(papers, min_hits=None):
     """
     第一层：本地 Regex 粗筛
@@ -35,7 +50,7 @@ def local_regex_coarse_filter(papers, min_hits=None):
     # 按长度降序排列以确保长词优先匹配
     all_keywords_sorted = sorted(all_keywords, key=len, reverse=True)
 
-    passed, n_bypass = [], 0
+    passed, n_bypass, n_matter = [], 0, 0
     for idx, paper in enumerate(papers, 1):
         title = paper.get("title", "")
         summary = paper.get("summary", "")
@@ -50,6 +65,14 @@ def local_regex_coarse_filter(papers, min_hits=None):
         #   "Tafel slope"（电化学）、"soil respiration"（生态）也捞进来。
         #   本地打分免费，让模型看标题判断，比任何词表都准。
         if _no_abstract(paper) and COARSE_NO_ABSTRACT_BYPASS:
+            # ★ 2026-10-01：加一道轻量闸 —— 挡掉"期刊事务性内容"。
+            #   原来是【标题也不看，摘要为空就全放行】。实测当前样本里
+            #   TOC/勘误/编委会是 0 例，但这类东西一旦混进来，
+            #   每一篇都要白花 0.7 秒让模型判"不相关"。
+            if _looks_like_matter(title):
+                paper["regex_hits"] = ["<事务性内容·丢弃>"]
+                n_matter += 1
+                continue
             paper["regex_hits"] = ["<无摘要·全收>"]
             passed.append(paper)
             n_bypass += 1
@@ -59,10 +82,23 @@ def local_regex_coarse_filter(papers, min_hits=None):
         #   锚定词×2 + 泛化词×1（泛化词表见 config.GENERIC_KEYWORDS）。
         #   理由见 config.py 里那段注释：只凭一个泛词通过的都是噪音。
         #   min_hits 仍然保留：显式传了就退回老的"计数"语义，方便对照。
-        anchor_hits, generic_hits = [], []
-        for kw in all_keywords_sorted:
-            if kw.lower() in text:
-                (generic_hits if kw in GENERIC_KEYWORDS else anchor_hits).append(kw)
+        # ★ 2026-10-01 修：关键词表里有【包含关系】（"landslide" ⊂ "shallow landslide"、
+        #   "降雨入渗" ⊃ "入渗"，实测 10 组），逐个匹配会让同一处文字被计两次：
+        #   一篇写 "shallow landslide" 的论文拿到 4 分而不是 2 分。
+        #   这不只是分数虚高 —— 【会改变判定】：只命中"稳定性分析"（泛化词）的论文，
+        #   重复计分 = 2 分通过，去重后 = 1 分本该被砍。
+        #   改法：all_keywords_sorted 是长→短排的，命中后若已被更长的命中词包含，
+        #   就不再单独计分。
+        matched = []
+        for kw in all_keywords_sorted:            # 长 → 短
+            kl = kw.lower()
+            if kl not in text:
+                continue
+            if any(kl in prev.lower() for prev in matched):
+                continue                          # 已被更长的命中词覆盖
+            matched.append(kw)
+        anchor_hits = [k for k in matched if k not in GENERIC_KEYWORDS]
+        generic_hits = [k for k in matched if k in GENERIC_KEYWORDS]
 
         if min_hits is not None:
             ok = (len(anchor_hits) + len(generic_hits)) >= min_hits
@@ -75,7 +111,8 @@ def local_regex_coarse_filter(papers, min_hits=None):
             passed.append(paper)
 
     print(f"  [输入] {len(papers)} 篇 → 粗筛后 {len(passed)} 篇"
-          f"（其中 {n_bypass} 篇是无摘要直接放行）")
+          f"（其中 {n_bypass} 篇是无摘要直接放行"
+          + (f"，另丢弃 {n_matter} 篇期刊事务性内容" if n_matter else "") + "）")
     _rule = (f"命中 ≥{min_hits} 个关键词" if min_hits is not None
              else f"加权分 ≥{COARSE_MIN_SCORE}（锚定词×2 + 泛化词×1）")
     print(f"  [规则] 有摘要者：{_rule}；无摘要者全收（交本地模型判）")
@@ -95,7 +132,8 @@ def limit_for_deepseek(papers, max_count=MAX_DEEPSEEK_INPUT):
     """
     if len(papers) <= max_count:
         return papers
-    print(f"\n  [限流] 粗筛后 {len(papers)} 篇超出阈值 {max_count}，随机采样中...")
+    print(f"\n  [限流] 粗筛后 {len(papers)} 篇超出阈值 {max_count}，"
+          f"按来源轮询采样中...")   # ★ 原来是"随机采样"，但实现是确定性轮询
     # 按 source 分层采样，尽量保证各来源都有代表
     from collections import defaultdict
     by_source = defaultdict(list)
@@ -130,17 +168,11 @@ def dual_track_filter(papers):
     print("=" * 60)
 
     papers.sort(key=lambda x: x.get("total_score", 0), reverse=True)
-    history = load_history()
-    deduped = []
-    skipped = 0
-    for p in papers:
-        lk = make_link_key(p)
-        if lk in history:
-            skipped += 1
-            continue
-        deduped.append(p)
-    if skipped > 0:
-        print(f"  [去重] 过滤掉 {skipped} 篇已推送过的文献")
+    # ★ 2026-10-01：原来这里读 history 去重 —— 但本函数在【打分之后】才被调用，
+    #   已推送过的文献还是先花了一遍算力/费用。history 检查已前置到 main() 的
+    #   score_all_papers 之前（那里才是该拦截的地方）。这里不再重复。
+    # history 去重已在 main() 打分之前完成，这里不再重复（原来会有 NameError 残留）
+    deduped = papers
 
     pass_list = []
     browsing_list = []
@@ -156,19 +188,23 @@ def dual_track_filter(papers):
             browsing_list.append(p)
 
     pass_list = pass_list[:MAX_EMAIL_RESULTS]
-    browsing_list = browsing_list[:MAX_EMAIL_RESULTS]
+    # ★ 2026-10-01：原来这里是 MAX_EMAIL_RESULTS（=10），
+    #   但泛读列表现在要进简报与待下载清单，截到 10 篇会把当天
+    #   评出的其余优质泛读文献静默丢掉。改用独立配额。
+    if MAX_BROWSING_RESULTS:
+        browsing_list = browsing_list[:MAX_BROWSING_RESULTS]
 
     print(f"  [轨道A] 总分≥{TOTAL_SCORE_PASS}/40: {sum(1 for p in pass_list if 'A' in p.get('pass_track',''))} 篇")
     print(f"  [轨道B] 创新分≥{INNOVATION_PASS}/10: {sum(1 for p in pass_list if 'B' in p.get('pass_track',''))} 篇")
     print(f"  [通关] {len(pass_list)} 篇 → 推送邮件 + .ris")
-    print(f"  [备选] {len(browsing_list)} 篇 → 仅终端 + .ris")
+    print(f"  [备选] {len(browsing_list)} 篇 → 终端 + .ris（进简报与待下载清单）")
     return pass_list, browsing_list
 
 
 # ══════════════════════════════════════════════
 # ★ 2026-10-01：主题黑名单预筛
 # ══════════════════════════════════════════════
-def blacklist_filter(papers, terms=None, drop=None):
+def blacklist_filter(papers, terms=None):
     """把「用不上」的主题直接刷掉，**放在打分之前** ⇒ 省下这些篇的打分时间。
 
     黑名单在 research_profile.BLACKLIST_TOPICS，用户原话：
@@ -177,10 +213,9 @@ def blacklist_filter(papers, terms=None, drop=None):
     匹配范围：标题 + （有摘要时）摘要。**无摘要的只匹配标题**——
     闭源论文只有标题可比，硬匹配摘要字段会把 "No abstract available" 也算进去。
 
-    返回 (保留, 被刷掉) 两个列表。
+    返回 (保留, 被刷掉) 两个列表。被刷掉的一律【不进入打分池】。
     """
     terms = BLACKLIST_TOPICS if terms is None else terms
-    drop = BLACKLIST_DROP if drop is None else drop
     lows = [t.lower() for t in terms]
     kept, killed = [], []
     for p in papers:
@@ -193,10 +228,9 @@ def blacklist_filter(papers, terms=None, drop=None):
             kept.append(p)
             continue
         p["_blacklist_hit"] = hit
-        if drop:
-            killed.append(p)
-        else:                       # 保留但强制 0 分
-            p["total_score"] = 0
-            p["reason"] = "拉黑主题：" + hit
-            kept.append(p)
+        # ★ 2026-10-01：删掉原来的 drop=False 分支。
+        #   那个分支"保留但强制 0 分"，但这些文献会被 main() 原封不动送进
+        #   score_all_papers，大模型重新打分并【覆盖】那个 0 分 ——
+        #   黑名单形同虚设。现在一律丢弃。
+        killed.append(p)
     return kept, killed

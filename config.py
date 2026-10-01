@@ -80,7 +80,11 @@ DEEPSEEK_MODEL = "deepseek-chat"
 TOTAL_SCORE_PASS = 30       # 轨道A：总分 ≥ 30/40
 INNOVATION_PASS = 9         # 轨道B：单项创新分 ≥ 9/10
 BROWSING_THRESHOLD = 24     # 备选泛读门槛：总分 ≥ 24/40
-MAX_EMAIL_RESULTS = 10      # 最终邮件最多保留篇数
+MAX_EMAIL_RESULTS = 15     # 邮件正文里列几篇（正文越短越好读）
+# ★ 2026-10-01：备选泛读原来也按 MAX_EMAIL_RESULTS=10 截断 ——
+#   但泛读列表现在会进【简报 + 待下载清单】，截到 10 篇等于把
+#   当天评出的其余优质泛读文献静默丢掉，损害文献库沉淀。单独给配额。
+MAX_BROWSING_RESULTS = 60  # 备选泛读最多留几篇（进简报与下载清单）
 MAX_DEEPSEEK_INPUT = 40     # 进入 DeepSeek 阶段的文献上限（防 API 费用暴涨）
 
 # ---- 中文核心期刊 ISSN（预留扩展列表）----
@@ -150,8 +154,7 @@ COARSE_MIN_SCORE = 2      # 加权分下限（锚定×2 + 泛化×1）
 # ---- 历史记录 & EndNote ----
 # ---- ★ 2026-10-01：研究画像 + 主题黑名单（定义在 research_profile.py，改那里即可）----
 from research_profile import (RESEARCH_PROFILE, BLACKLIST_TOPICS,
-                              BLACKLIST_DROP, BLACKLIST_TITLE_ONLY,
-                              QUALITATIVE_FIELDS)
+                              BLACKLIST_TITLE_ONLY, QUALITATIVE_FIELDS)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")

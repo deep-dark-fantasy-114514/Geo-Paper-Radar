@@ -77,8 +77,10 @@ BLACKLIST_TOPICS = [
     "古滑坡", "老滑坡", "古滑坡体",
 ]
 
-# 命中黑名单后是否【直接丢弃】（True）还是【保留但强制 0 分】（False）
-BLACKLIST_DROP = True
+# ★ 2026-10-01：原来有个 BLACKLIST_DROP 开关，设 False 会「保留但强制 0 分」，
+#   但那样这些文献会被 main() 原封不动送进 score_all_papers，
+#   大模型会重新打分并【覆盖】那个 0 分 —— 完全击穿黑名单的意义。
+#   这是个只在 False 时才炸的坑，索性去掉开关：**一律直接丢弃**。
 
 # 是否【只匹配标题】（True）还是标题+摘要都匹配（False，默认）
 #   False 更彻底，但有误杀风险：某些通用词（travel distance / runout）

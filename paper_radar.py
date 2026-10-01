@@ -242,6 +242,19 @@ def main():
     # 阶段 C: DeepSeek 打分 + 双轨制
     # ==========================
 
+    # C0: ★ 已推送过的不再重复打分（2026-10-01）
+    #   原来这道检查在 dual_track_filter 里，而那是在【打分之后】才跑的 ——
+    #   已推送过的文献还是先花了一遍算力/费用。挪到打分之前才叫拦截。
+    try:
+        _hist = load_history()
+        _b0 = len(deepseek_input)
+        deepseek_input = [p for p in deepseek_input
+                          if make_link_key(p) not in _hist]
+        if _b0 != len(deepseek_input):
+            print(f"  [历史去重] 已推送过 {_b0 - len(deepseek_input)} 篇，不再重复打分")
+    except Exception as e:
+        print(f"  [警告] 历史去重失败（本轮不拦）：{e}")
+
     # C1: 细筛（默认走本地 Qwen，失败才回退 DeepSeek）
     scored_papers = score_all_papers(deepseek_input, phase_label="细筛")
     if not scored_papers:
