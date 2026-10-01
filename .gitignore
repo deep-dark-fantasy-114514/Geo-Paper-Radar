@@ -1,4 +1,13 @@
 .env
 __pycache__/
 *.pyc
+
+# ---- 本地数据（只在本机存在，不进仓库）----
 EndNote_Watch/
+Library/
+PDF_Inbox/
+.harvest_consumed.json
+*.bak_*
+
+# 注意：harvest/ 必须【提交】——那是云端在笔记本睡着时攒下的候选，
+# 本机要靠 raw HTTP 回捞它。不要把它加进来。

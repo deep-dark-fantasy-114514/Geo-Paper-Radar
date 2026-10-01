@@ -114,6 +114,55 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 ENDNOTE_WATCH_DIR = os.path.join(BASE_DIR, "EndNote_Watch")
 
+# ---- ★ 2026-10-01 新增：OA PDF 自动下载 ----
+# 为什么要它：EndNote 的「PDF 自动导入文件夹」只认 PDF，不认 .ris
+# （官方只提供了 PDF Handling 的自动导入）。所以要让流程"无需人工介入"，
+# 必须把开放获取(OA)论文的 PDF 也抓下来，丢进 EndNote 的自动导入文件夹。
+# 首次配置（只做一次）：EndNote → Edit → Preferences → PDF Handling
+#   ☑ Enable automatic importing，PDF Auto Import Folder = 下面这个目录
+PDF_INBOX_DIR = os.path.join(BASE_DIR, "PDF_Inbox")
+PDF_DOWNLOAD_ENABLED = True      # 想临时关掉就设 False
+PDF_MAX_PER_RUN = 20             # 单次最多下几篇，防止失控
+PDF_MAX_MB = 60                  # 单个 PDF 体积上限（MB）
+PDF_MIN_BYTES = 20 * 1024        # 小于 20 KB 的多半是错误页，丢弃
+
+# ---- ★ 2026-10-01 新增：本地打分 + 自动归档 ----
+# 用本地 Qwen3.5-9B 打分：0.7~1.1 s/篇、成本为 0 ⇒ 候选规模可以从 40 放开到几百
+#
+# ★★ 本地/云端自动判别 ★★
+# GitHub Actions 跑在 ubuntu-latest 上，拿不到本机的 Qwen、视觉桥、Library 目录，
+# 也没有 EndNote 的自动导入文件夹。所以按平台自动降级：
+#   · 本机(Windows) → 完整流程：本地打分 + 下载 + 重命名 + 归档 + 简报
+#   · 云端(Linux)   → 轻量流程：抓取 + DeepSeek 打分 + .ris + 邮件（老行为）
+# 这样同一份代码两边都能跑，不用维护两个分支。
+LOCAL_MODE = (os.name == "nt")
+PDF_DOWNLOAD_ENABLED = LOCAL_MODE   # 云端下载了也没处放，直接关掉
+
+SCORER = os.getenv("PAPER_RADAR_SCORER",
+                   "local" if LOCAL_MODE else "deepseek")   # local | deepseek
+MAX_CANDIDATES = 500          # 送入打分的候选上限（仅对 local 生效）
+COARSE_MIN_HITS = 1           # 粗筛命中阈值。旧值是 2（实测只剩 79/1033 篇，丢掉 93%）
+                              #   1 → 270 篇（约 5 分钟）；0 → 全部 1033 篇（约 19 分钟）
+                              #   本地打分免费，想更彻底就把这个改成 0
+AUTO_RENAME_PDF = LOCAL_MODE      # 下载后用本地视觉模型重命名为【中文名】
+AUTO_FILE_TO_LIBRARY = LOCAL_MODE  # 归档到 Library\<主题>\ 并复制一份到 PDF_Inbox\
+
+# ---- ★★ 2026-10-01 新增：云端"攒候选"模式 ----
+# 动机：新流程的打分/下载/重命名/归档全依赖本机（GPU + 磁盘 + EndNote），
+#       云端跑到不了那半步。而笔记本（本机就是笔记本）合盖就睡，任务跑不了。
+# 分工：云端每天只做【抓取】，把粗筛后的候选存成 JSON 提交回仓库（不花钱）；
+#       本机开机后把这些候选合并进自己的池子，再跑完整流程。
+#       ⇒ 笔记本睡几天也不漏文献。
+HARVEST_MODE = os.getenv("PAPER_RADAR_MODE", "").lower() == "harvest"
+HARVEST_DIR = os.path.join(BASE_DIR, "harvest")
+HARVEST_KEEP_DAYS = 14        # 本地只回捞最近 N 天的云端候选
+HARVEST_ABSTRACT_CHARS = 800  # 摘要截断长度（控制仓库体积：约 300 KB/天）
+HARVEST_CONSUMED = os.path.join(BASE_DIR, ".harvest_consumed.json")
+
+# 仓库 raw 地址（仓库是公开的，无需 token）
+REPO_RAW = ("https://raw.githubusercontent.com/"
+            "deep-dark-fantasy-114514/Geo-Paper-Radar/main/harvest/")
+
 # ---- 杂项 ----
 FETCH_HOURS = 24         # RSS 抓取窗口（小时）
 REQUEST_TIMEOUT = 30     # HTTP 请求超时
@@ -383,12 +432,21 @@ class OpenAlexFetcher:
                 return None
 
             # 提取 DOI / URL
+            # ★ 2026-10-01 更正：原变量名 pdf_url 名不副实——它取的其实是
+            #   【落地页】(landing_page_url)，从来不是 PDF 直链。已改名避免误解。
             doi = work.get("doi", "") or ""
             openalex_url = work.get("id", "") or ""
             primary_location = work.get("primary_location", {}) or {}
-            pdf_url = primary_location.get("landing_page_url", "") or ""
+            landing_url = primary_location.get("landing_page_url", "") or ""
 
-            link = doi or pdf_url or openalex_url
+            link = doi or landing_url or openalex_url
+
+            # ★ 2026-10-01 新增：取真正的 OA PDF 直链（用于自动下载）
+            best_oa = work.get("best_oa_location") or {}
+            oa_info = work.get("open_access") or {}
+            oa_pdf_url = (best_oa.get("pdf_url") or
+                          oa_info.get("oa_url") or "").strip()
+            is_oa = bool(oa_info.get("is_oa")) or bool(oa_pdf_url)
 
             # 提取摘要（OpenAlex 的 abstract_inverted_index）
             abstract = self._extract_abstract(work.get("abstract_inverted_index", {}))
@@ -425,6 +483,8 @@ class OpenAlexFetcher:
                 "issn": issn_list,
                 "is_chinese_journal": is_chinese,
                 "openalex_id": openalex_url,
+                "oa_pdf_url": oa_pdf_url,     # ★ 新增：OA PDF 直链（可为空）
+                "is_oa": is_oa,               # ★ 新增：是否开放获取
             }
 
         except Exception as e:
@@ -449,12 +509,17 @@ class OpenAlexFetcher:
 # 5. 模块三：两阶段过滤（V3.0 核心）
 # ══════════════════════════════════════════════
 
-def local_regex_coarse_filter(papers):
+def local_regex_coarse_filter(papers, min_hits=None):
     """
     第一层：本地 Regex 粗筛
-    规则：标题或摘要中命中至少 2 个核心关键词（中英文任一）
-    目的：300 篇 → 约 20-30 篇，减少 DeepSeek API 调用
+
+    ★ 2026-10-01 更改：粗筛阈值可调，且 SCORER=local 时自动降到 1。
+      原因：粗筛原本的唯一目的是【省 DeepSeek 的 API 费】。改用本地打分后
+      这个目的不复存在，而硬卡"≥2 命中"实测只剩 79/1033 篇——**丢掉 93%**，
+      正是"漏掉优质文献"的真凶。放宽到 ≥1 后再由本地模型做精细判断。
     """
+    if min_hits is None:
+        min_hits = COARSE_MIN_HITS if SCORER == "local" else 2
     print("\n" + "=" * 60)
     print("【第一阶段】本地 Regex 粗筛")
     print("=" * 60)
@@ -477,15 +542,16 @@ def local_regex_coarse_filter(papers):
             if kw.lower() in text:
                 hit_count += 1
                 hit_words.append(kw)
-                if hit_count >= 2:  # 命中 2 个即满足条件
+                if hit_count >= min_hits:
                     break
 
-        if hit_count >= 2:
+        if hit_count >= min_hits:
             paper["regex_hits"] = hit_words[:5]  # 记录前 5 个命中词
             passed.append(paper)
 
     print(f"  [输入] {len(papers)} 篇 → 粗筛后 {len(passed)} 篇")
-    print(f"  [规则] 标题/摘要命中 ≥2 个核心关键词")
+    print(f"  [规则] 标题/摘要命中 ≥{min_hits} 个核心关键词"
+          f"（SCORER={SCORER}）")
     print(f"  [中文关键词数] {len(KEYWORD_LIST_CN)} 个   [英文关键词数] {len(KEYWORD_LIST_EN)} 个")
 
     # 打印几个样本
@@ -595,7 +661,35 @@ def score_paper_with_deepseek(title, abstract):
 
 
 def score_all_papers(papers, phase_label="DeepSeek"):
-    """对文献列表进行 DeepSeek 打分"""
+    """对文献列表打分。
+
+    ★ 2026-10-01：默认走【本地 Qwen3.5-9B】（免费、0.7~1.1 s/篇），
+    规模从 40 放开到 MAX_CANDIDATES=500。本地不可用时自动回退 DeepSeek。
+    """
+    if SCORER == "local" and papers:
+        print("\n" + "=" * 60)
+        print(f"【第二阶段】本地 Qwen3.5-9B 多维度打分（免费，共 {len(papers)} 篇）")
+        print("=" * 60)
+        try:
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            import local_scorer
+            scored = local_scorer.score_all(papers)
+        except Exception as e:
+            print(f"  [Error] 本地打分模块异常：{e}")
+            scored = None
+        if scored:
+            for p in scored:                       # 补齐与 DeepSeek 版一致的派生字段
+                ts = p.get("total_score", 0)
+                p["recommendation"] = ("strong" if ts >= TOTAL_SCORE_PASS
+                                       else ("normal" if ts >= BROWSING_THRESHOLD
+                                             else "weak"))
+                p["score"] = round(ts / 40 * 100)
+            return scored
+        print("  [回退] 本地打分不可用，改用 DeepSeek")
+
+    # ─────────────── 以下为原 DeepSeek 路径（保留作后备） ───────────────
     print("\n" + "=" * 60)
     print(f"【第二阶段】DeepSeek AI 多维度打分 ({phase_label})")
     print("=" * 60)
@@ -717,6 +811,197 @@ def generate_ris_file(paper):
         return None
 
 
+# ══════════════════════════════════════════════
+# ★ 2026-10-01 新增：OA PDF 自动下载
+# ══════════════════════════════════════════════
+
+def _grab(url, hdr):
+    """取一个 URL 的内容，带体积上限。返回 (blob, content_type, status, truncated)。"""
+    cap = PDF_MAX_MB * 1024 * 1024
+    r = requests.get(url, headers=hdr, timeout=REQUEST_TIMEOUT,
+                     stream=True, allow_redirects=True)
+    if r.status_code != 200:
+        return b"", (r.headers.get("Content-Type") or "").lower(), r.status_code, False
+    chunks, size, trunc = [], 0, False
+    for ch in r.iter_content(65536):
+        if not ch:
+            continue
+        chunks.append(ch)
+        size += len(ch)
+        if size > cap:
+            trunc = True
+            break
+    return (b"".join(chunks), (r.headers.get("Content-Type") or "").lower(),
+            200, trunc)
+
+
+# 出版商在落地页里官方声明 PDF 直链的标准写法
+_META_PDF_PATTERNS = [
+    r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']citation_pdf_url["\']',
+    r'<link[^>]+type=["\']application/pdf["\'][^>]+href=["\']([^"\']+)["\']',
+]
+
+
+def _find_pdf_url(html_bytes, base_url):
+    """从落地页 HTML 里找出出版商声明的 PDF 直链。找不到返回 None。"""
+    if not html_bytes:
+        return None
+    html = html_bytes[:500000].decode("utf-8", "ignore")
+    for pat in _META_PDF_PATTERNS:
+        m = re.search(pat, html, re.I)
+        if m:
+            u = urllib.parse.urljoin(base_url, m.group(1).strip())
+            if u.startswith("http"):
+                return u
+    return None
+
+
+def download_oa_pdf(paper):
+    """把开放获取(OA)论文的 PDF 下到 PDF_Inbox。
+
+    为什么需要：EndNote 的「PDF 自动导入文件夹」只认 PDF、不认 .ris，
+    所以要让整条流程"无需人工介入"，必须把 OA 论文的 PDF 也抓下来。
+    下到的 PDF 同时也能直接喂给 pdf2md 做精读，一举两得。
+
+    设计原则：**绝不因下载失败中断主流程**——一律吞异常，只记一行。
+    幂等：同名文件已存在则跳过。
+    """
+    if not PDF_DOWNLOAD_ENABLED:
+        return None
+    url = (paper.get("oa_pdf_url") or "").strip()
+    if not url:
+        return None
+    os.makedirs(PDF_INBOX_DIR, exist_ok=True)
+    try:
+        title = paper.get("title", "Untitled")
+        score = paper.get("total_score", 0)
+        ds = paper.get("data_source", "RSS")
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        filename = f"{date_str}_{ds[:4]}_{score}分_{safe_filename(title, 40)}.pdf"
+        filepath = os.path.join(PDF_INBOX_DIR, filename)
+        if os.path.exists(filepath):          # 幂等
+            return filepath
+
+        # ★ 带上 Referer：不少出版商（MDPI / ScienceDirect 等）会校验来源页
+        hdr = get_chrome_headers()
+        ref = (paper.get("link") or "").strip()
+        if ref.startswith("http"):
+            hdr["Referer"] = ref
+        hdr["Accept"] = "application/pdf,text/html,*/*;q=0.8"
+
+        blob, ctype, status, trunc = _grab(url, hdr)
+        if status != 200:
+            print(f"     ⚠ PDF HTTP {status}：{title[:40]}")
+            return None
+        if trunc:
+            print(f"     ⚠ PDF 超过 {PDF_MAX_MB} MB，放弃：{title[:40]}")
+            return None
+
+        # ★ 2026-10-01：拿到 HTML 说明这是【落地页】而不是 PDF。
+        #   出版商普遍用 <meta name="citation_pdf_url"> 官方声明 PDF 直链
+        #   （Springer / AGU / Wiley 等都遵守），顺着它再取一次。
+        if not blob.startswith(b"%PDF"):
+            real = _find_pdf_url(blob, url)
+            if real:
+                b2, c2, st2, tr2 = _grab(real, hdr)
+                if st2 == 200 and not tr2 and b2.startswith(b"%PDF"):
+                    blob, ctype = b2, c2
+        if not blob.startswith(b"%PDF"):
+            print(f"     ⚠ 不是 PDF（{ctype or '未知类型'}）：{title[:40]}")
+            return None
+        if len(blob) < PDF_MIN_BYTES:
+            print(f"     ⚠ PDF 过小（{len(blob)} B），丢弃：{title[:40]}")
+            return None
+
+        with open(filepath, "wb") as f:
+            f.write(blob)
+        return filepath
+    except Exception as e:
+        print(f"     ⚠ PDF 下载失败（{type(e).__name__}）：{str(e)[:60]}")
+        return None
+
+
+def download_all_oa_pdfs(papers):
+    """下载 OA PDF → 重命名为中文名 → 归入 Library\\<主题>\\ + 复制到 PDF_Inbox。
+
+    ★ 2026-10-01：由"只下载"升级为"下载+重命名+归档"一条龙。
+    返回归档后的文件路径列表。任何一步失败都只跳过该篇，不中断整批。
+    """
+    if not PDF_DOWNLOAD_ENABLED:
+        print("\n  [PDF] 自动下载已关闭（PDF_DOWNLOAD_ENABLED=False）")
+        return [], set()
+    oa_papers = [p for p in papers if p.get("oa_pdf_url")]
+    print(f"\n{'=' * 60}")
+    print(f"【OA PDF 下载 → 重命名 → 归档】{len(oa_papers)}/{len(papers)} 篇有 OA 链接"
+          f"（本轮上限 {PDF_MAX_PER_RUN}）")
+    print("=" * 60)
+    if not oa_papers:
+        print("  本轮无 OA 链接可直接下载（其余进待下载清单，等手动下载）")
+        return [], set()
+
+    batch = oa_papers[:PDF_MAX_PER_RUN]
+    # 先把 PDF 都下下来（不依赖本地模型）
+    downloaded = []
+    for p in batch:
+        fp = download_oa_pdf(p)
+        if fp:
+            downloaded.append((p, fp))
+            print(f"  ⬇ {os.path.basename(fp)[:70]}")
+    print(f"  [下载] 成功 {len(downloaded)}/{len(batch)} 篇")
+
+    if not downloaded:
+        return [], set()
+
+    # 再统一重命名 + 归档（本地模型只起停一次）
+    lm = None
+    ai = rn = None
+    if AUTO_FILE_TO_LIBRARY or AUTO_RENAME_PDF:
+        try:
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            import library_manager as lm
+            lm.ensure_dirs()
+            if AUTO_RENAME_PDF:
+                ai = lm._load_module(lm.ASK_IMAGE, "ask_image")
+                rn = lm._load_module(lm.RENAMER, "rename_pdfs_ai")
+                if not ai.health():
+                    if not ai.start_server():
+                        print("  [警告] 本地模型起不来，本轮跳过重命名（PDF 仍会归档）")
+                        ai = rn = None
+        except Exception as e:
+            print(f"  [警告] 归档模块加载失败：{e}")
+            lm = None
+            ai = rn = None
+
+    filed, filed_keys = [], set()
+    try:
+        for p, fp in downloaded:
+            if lm is None:
+                filed.append(fp)
+                continue
+            dst, cat = lm.file_paper(
+                fp, p, ai=ai, rn=rn,
+                do_rename=(AUTO_RENAME_PDF and ai is not None))
+            if dst:
+                filed.append(dst)
+                try:
+                    filed_keys.add(lm.key_of(p))
+                except Exception:
+                    pass
+                print(f"  📁 [{cat}] {os.path.basename(dst)[:66]}")
+    finally:
+        if ai is not None:
+            try:
+                ai.stop_server()
+            except Exception:
+                pass
+
+    print(f"  [汇总] 已归档 {len(filed)} 篇到 {lm.LIBRARY_DIR if lm else PDF_INBOX_DIR}")
+    return filed, filed_keys
+
+
 def build_html_email_v3(papers):
     """V3.0 HTML 邮件（增加数据源标记）"""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -834,10 +1119,129 @@ def send_email(html_content, attachments=None):
 
 
 # ══════════════════════════════════════════════
+# ★ 2026-10-01 新增：云端"攒候选" + 本地"回捞"
+# ══════════════════════════════════════════════
+
+def fetch_all_candidates():
+    """抓 RSS + OpenAlex 并全局去重。"""
+    all_papers = []
+    rss = fetch_papers_from_rss()
+    if rss:
+        all_papers.extend(rss)
+    try:
+        oa = OpenAlexFetcher(mailto=SMTP_SENDER or "radar@example.com").fetch_papers()
+        if oa:
+            all_papers.extend(oa)
+    except Exception as e:
+        print(f"  [Warning] OpenAlex 抓取失败：{e}")
+    seen, deduped = set(), []
+    for p in all_papers:
+        t = (p.get("title") or "").strip().lower()
+        if t and t not in seen:
+            seen.add(t)
+            deduped.append(p)
+    return deduped
+
+
+HARVEST_FIELDS = ("title", "link", "source", "data_source", "doi", "authors",
+                  "year", "issn", "is_chinese_journal", "openalex_id",
+                  "oa_pdf_url", "is_oa", "regex_hits")
+
+
+def run_harvest():
+    """★ 云端模式：只抓取 → 粗筛 → 存 JSON。
+
+    不打分、不发邮件、不下载、**不花钱**。存在的意义只有一个：
+    笔记本合盖睡着时，云端照样把当天的候选记下来，等开机后回捞。
+    """
+    print("\n" + "#" * 62)
+    print("#  云端 HARVEST 模式 —— 只攒候选，不打分不通知（免费）")
+    print("#" * 62)
+    cand = fetch_all_candidates()
+    if not cand:
+        print("[结果] 没抓到任何候选")
+        return 0
+    kept = local_regex_coarse_filter(cand, min_hits=COARSE_MIN_HITS)
+    slim = []
+    for p in kept[:MAX_CANDIDATES]:
+        rec = {k: p.get(k) for k in HARVEST_FIELDS}
+        rec["summary"] = (p.get("summary") or "")[:HARVEST_ABSTRACT_CHARS]
+        slim.append(rec)
+    os.makedirs(HARVEST_DIR, exist_ok=True)
+    day = datetime.now().strftime("%Y-%m-%d")
+    path = os.path.join(HARVEST_DIR, f"{day}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"date": day, "count": len(slim), "papers": slim},
+                  f, ensure_ascii=False)
+    print(f"\n[完成] 已写 {path}（{len(slim)} 篇，"
+          f"{os.path.getsize(path)/1024:.0f} KB）")
+    return 0
+
+
+def _load_consumed():
+    try:
+        with open(HARVEST_CONSUMED, encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _save_consumed(s):
+    try:
+        with open(HARVEST_CONSUMED, "w", encoding="utf-8") as f:
+            json.dump(sorted(s), f)
+    except Exception:
+        pass
+
+
+def merge_harvest(cand):
+    """把云端攒的候选（最近 N 天、且本地尚未消费过的）合并进本地候选池。
+
+    ★ 刻意【不用 git pull】：本地在 v3.0-dev 分支且有未提交改动，
+      pull 会冲突。仓库是公开的，直接走 raw HTTP 取，无副作用。
+    """
+    consumed = _load_consumed()
+    seen = set((p.get("title") or "").strip().lower() for p in cand)
+    added, marks = 0, []
+    for i in range(HARVEST_KEEP_DAYS):
+        day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        if day in consumed:
+            continue
+        try:
+            r = requests.get(REPO_RAW + day + ".json", timeout=20)
+            if r.status_code != 200:
+                continue
+            d = r.json()
+        except Exception:
+            continue                     # 那天云端没跑 / 网络不通，跳过即可
+        got = 0
+        for p in d.get("papers", []):
+            t = (p.get("title") or "").strip().lower()
+            if t and t not in seen:
+                seen.add(t)
+                p["from_harvest"] = day
+                cand.append(p)
+                got += 1
+        consumed.add(day)
+        marks.append("%s(+%d)" % (day, got))
+        added += got
+    if marks:
+        _save_consumed(consumed)
+        print("  [云端候选] 回捞 %d 篇：%s" % (added, ", ".join(marks)))
+    else:
+        print("  [云端候选] 无新的可回捞（或仓库不可达）")
+    return cand
+
+
+# ══════════════════════════════════════════════
 # 8. 主流程 (V3.0)
 # ══════════════════════════════════════════════
 
 def main():
+    # ★ 云端模式：只攒候选就退出（不打分、不发邮件、不下载）
+    if HARVEST_MODE:
+        return run_harvest()
+
     print("\n" + "🌟" * 30)
     print("  Geo_Paper_Radar V3.0 — 地学文献雷达启动")
     print("  数据源: RSS + OpenAlex  |  过滤: 两阶段  |  双轨制筛选")
@@ -860,6 +1264,10 @@ def main():
     oa_papers = oa_fetcher.fetch_papers()
     if oa_papers:
         all_papers.extend(oa_papers)
+
+    # ★ 2026-10-01：把云端（GitHub Actions）在笔记本睡着时攒下的候选合并进来。
+    #   放在"无数据就退出"之前——万一本地网络抽风抓不到，云端攒的还是能兜住。
+    all_papers = merge_harvest(all_papers)
 
     if not all_papers:
         print("\n[结果] 所有数据源均无新文献，任务结束")
@@ -895,8 +1303,11 @@ def main():
         print("\n[结果] 粗筛后无文献通过，任务结束")
         return
 
-    # B2: 限流（防止 API 费用暴涨）
-    deepseek_input = limit_for_deepseek(coarse_papers, MAX_DEEPSEEK_INPUT)
+    # B2: 限流
+    # ★ 2026-10-01：本地打分免费 ⇒ 上限从 40 放开到 MAX_CANDIDATES=500
+    #   （DeepSeek 路径仍按 MAX_DEEPSEEK_INPUT=40 卡住，防止 API 费用暴涨）
+    _cap = MAX_CANDIDATES if SCORER == "local" else MAX_DEEPSEEK_INPUT
+    deepseek_input = limit_for_deepseek(coarse_papers, _cap)
 
     # ==========================
     # 阶段 C: DeepSeek 打分 + 双轨制
@@ -948,6 +1359,53 @@ def main():
     print(f"\n  [汇总] 共生成 {ris_generated} 个 .ris 文件")
 
     # ==========================
+    # 阶段 D2: ★ OA PDF 自动下载（2026-10-01 新增）
+    # ==========================
+    # 下到 PDF_Inbox ⇒ EndNote 的「PDF 自动导入文件夹」会自动入库，
+    # 从而免去"去 QQ 邮箱手动下载 .ris 再导入"这一步。
+    pdf_saved, filed_keys = download_all_oa_pdfs(pass_list + browsing_list)
+
+    # ==========================
+    # 阶段 F2: ★ 待下载清单（2026-10-01 新增）
+    # ==========================
+    # 高分但【没能自动拿到 PDF】的（闭源，或 Wiley/MDPI 的 403 拦截）
+    # ⇒ 出一份含 DOI 的清单；你手动下载后丢进 E:\论文\手动下载\，
+    #   跑一次 manual_ingest.py 就自动重命名+归类+进 EndNote。
+    dl_csv, dl_n = None, 0
+    try:
+        import sys as _sys
+        if BASE_DIR not in _sys.path:
+            _sys.path.insert(0, BASE_DIR)
+        import library_manager as _lm2
+        _lm2.ensure_dirs()
+        dl_csv, dl_n = _lm2.build_download_list(pass_list + browsing_list,
+                                                filed_keys)
+        if dl_csv:
+            print(f"\n📥 待下载清单（{dl_n} 篇）：{dl_csv}")
+            print(f"   手动下载后丢进 {_lm2.MANUAL_DROP_DIR}，"
+                  f"再跑 python manual_ingest.py")
+    except Exception as e:
+        print(f"\n[警告] 待下载清单生成失败：{type(e).__name__}: {e}")
+
+    # ==========================
+    # 阶段 F: ★ 文献简报（2026-10-01 新增）
+    # ==========================
+    # 告诉你"什么文献可能需要精读"——按总分排序，附四维分与中文理由
+    digest_path = None
+    try:
+        import sys as _sys
+        if BASE_DIR not in _sys.path:
+            _sys.path.insert(0, BASE_DIR)
+        import library_manager as _lm
+        _lm.ensure_dirs()
+        digest_path = _lm.build_digest(pass_list, browsing_list,
+                                       len(scored_papers),
+                                       time.time() - start_time)
+        print(f"\n📋 文献简报：{digest_path}")
+    except Exception as e:
+        print(f"\n[警告] 简报生成失败：{type(e).__name__}: {e}")
+
+    # ==========================
     # 阶段 E: 空转保护 + 邮件
     # ==========================
 
@@ -977,6 +1435,14 @@ def main():
     print(f"📊 RSS {rss_count} + OpenAlex {oa_count} → 粗筛 {len(coarse_papers)} "
           f"→ DeepSeek {len(scored_papers)} → 通关 {len(pass_list)} → 备选 {len(browsing_list)}")
     print(f"📬 邮箱: {SMTP_RECEIVER}  |  📁 .ris: {ENDNOTE_WATCH_DIR}")
+    print(f"📥 OA PDF: {PDF_INBOX_DIR}（已存 {len(pdf_saved)} 篇）")
+    if pdf_saved:
+        print("   ↳ 若 EndNote 已配置「PDF 自动导入文件夹」指向该目录，将自动入库")
+    if digest_path:
+        print(f"📋 文献简报: {digest_path}")
+    if dl_csv:
+        print(f"📥 待下载清单: {dl_csv}（{dl_n} 篇）")
+    print(f"🧠 打分器: {SCORER}（local = 本地 Qwen3.5-9B，免费）")
     print(f"{'=' * 60}")
 
 

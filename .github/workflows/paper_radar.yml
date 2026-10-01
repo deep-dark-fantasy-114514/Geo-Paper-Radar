@@ -1,4 +1,19 @@
-name: Geo Paper Radar Daily
+name: Geo Paper Radar Daily (Harvest)
+
+# ★ 2026-10-01 改造：云端不再打分、不发邮件、不花钱。
+#
+# 为什么：升级后的流程里，打分要本地 Qwen、下载/重命名要本地视觉模型、
+# 归档要本地磁盘和 EndNote —— 云端（ubuntu runner）一样都没有。
+# 而本机是【笔记本】，合盖就睡，定时任务跑不了。
+#
+# 所以分工成两半：
+#   · 云端（本文件）：每天只【抓取】，把候选存成 harvest/YYYY-MM-DD.json 提交回仓库。
+#                     不调任何付费 API，secret 一个都不需要。
+#   · 本机（10:00 的 Windows 计划任务）：用 raw HTTP 回捞这些候选，
+#                     合并后跑完整流程（本地打分 → 下载 → 重命名 → 归档 → 简报）。
+#   ⇒ 笔记本睡几天也不漏文献。
+#
+# 注意：harvest 模式不读 .env，所以本地那套 DeepSeek / SMTP 密钥在云端已无必要。
 
 on:
   schedule:
@@ -7,11 +22,11 @@ on:
   workflow_dispatch:  # 允许手动触发
 
 jobs:
-  paper-radar:
+  harvest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     permissions:
-      contents: write  # 允许自动 commit history.json
+      contents: write  # 允许把候选提交回仓库
 
     steps:
       - name: Checkout 仓库
@@ -25,23 +40,22 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      - name: 运行文献雷达
+      - name: 抓取候选（不打分、不发邮件）
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_RECEIVER: ${{ secrets.SMTP_RECEIVER }}
+          PAPER_RADAR_MODE: harvest
         run: python paper_radar.py
 
-      - name: 提交 history.json（如有更新）
+      - name: 清理过期候选（保留 14 天，控制仓库体积）
+        run: |
+          find harvest -name '*.json' -mtime +14 -print -delete 2>/dev/null || true
+
+      - name: 提交候选
         if: success()
         run: |
           git config user.name "Geo-Paper-Radar-Bot"
           git config user.email "bot@geo-paper-radar.local"
-          git add history.json
+          git add harvest/ history.json
           git diff --staged --quiet || (
-            git commit -m "Auto: 更新历史记录 $(date +%Y-%m-%d)" &&
+            git commit -m "Auto: 云端候选 $(date +%Y-%m-%d)" &&
             git push
           )
