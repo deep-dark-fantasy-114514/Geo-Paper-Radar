@@ -37,7 +37,16 @@ try:
 except Exception:
     pass
 
-ASK_IMAGE = r"C:\Users\zihao\.claude\skills\local-vision\scripts\ask_image.py"
+# ★ 2026-10-01：删掉本文件里的硬编码路径。上一轮把它挪进了 config.ASK_IMAGE
+#   （可 PAPER_RADAR_ASK_IMAGE 覆盖），却漏了这一处 —— 它在这里 **遮蔽** 了
+#   config 的值，等于白改。
+#   （教训：改路径这类事要 grep 全仓；同一常量有两处定义就一定会漂。）
+
+# 与 paper_radar.py 保持一致的四维度定义
+# ★ 2026-10-01 熔断阈值（见 score_all 里的说明）
+FUSE_CONSEC_FAIL = 6      # 连续这么多篇失败 ⇒ 判定服务已死
+FUSE_MIN_SAMPLE = 20      # 至少跑这么多篇才看失败率（防前几篇抖动误判）
+FUSE_FAIL_RATE = 0.5      # 失败率超过这个 ⇒ 判定服务异常
 
 # 与 paper_radar.py 保持一致的四维度定义
 DIMS = [
@@ -52,8 +61,12 @@ SYSTEM = (
     "你的任务是对文献做初筛打分，判断它对下面这位研究者的**研究主线**"
     "有多大帮助。评分要果断、有区分度，不要都给中间分。\n\n"
     + RESEARCH_PROFILE +
+    # ★ 2026-10-01：黑名单改为从 research_profile.BLACKLIST_TOPICS 动态插值。
+    #   原来在这里手抄了 3 个词（地震滑坡/滑坡动力学/古滑坡），而真正的名单有
+    #   32 个 —— 你在 research_profile.py 里加一条，这里的提示词完全感知不到，
+    #   打分规则和前置过滤规则就分家了。
     "\n■ 遇到下列主题【直接给 0 分】（它们与本研究完全无关）：\n"
-    "   地震滑坡 / 滑坡动力学与运动学（滑速、运动距离、碎屑流）/ 古滑坡\n"
+    "   " + "、".join(BLACKLIST_TOPICS) + "\n"
 )
 
 # 定性字段的采集说明（不计分，只进简报供筛选）
@@ -71,7 +84,7 @@ _QUAL_SPEC = (
 def build_prompt(title, abstract):
     dims_txt = "\n".join(
         f"{i}. {k}（{d}）0-10 分" for i, (k, d) in enumerate(DIMS, 1))
-    no_ab = (not abstract) or abstract.startswith("No abstract")
+    no_ab = no_abstract(abstract)      # ★ 统一判空（带 strip，见 config.no_abstract）
     if no_ab:
         # ★ 2026-10-01（用户定）：**只有标题的论文【不打分】**。
         #   标题的信息量不足以支撑"四维 0-10 分"这种细粒度评分，硬打出来的分数不可信。
@@ -123,17 +136,32 @@ def build_prompt(title, abstract):
     )
 
 
+_JSON_DEC = json.JSONDecoder()
+
+
 def parse_json(text):
-    """模型偶尔会包代码块或加废话，容错提取。"""
-    t = (text or "").strip()
-    t = t.replace("```json", " ").replace("```", " ").strip()
-    i, j = t.find("{"), t.rfind("}")
-    if i < 0 or j <= i:
-        return None
-    try:
-        return json.loads(t[i:j + 1])
-    except Exception:
-        return None
+    """模型偶尔会包代码块或加废话，容错提取第一个**完整合法**的 JSON 对象。
+
+    ★ 2026-10-01：原来是 `t[find("{") : rfind("}")+1]` —— 它假设文本里
+      只有一对外层大括号。一旦模型在正式输出前先来一句带花括号的说明
+      （例如 `示例格式：{"a":1}` 或 `{...}` 占位），find 会抓到前一段的左括号、
+      rfind 抓到后一段的右括号，切出来的东西横跨两个 JSON 块 ⇒ json.loads 抛错
+      ⇒ 这篇被判"打分失败"。
+      ⇒ 改用 `JSONDecoder.raw_decode`：从每个 `{` 处试解析，
+        它内部会正确地配对括号并跳过字符串里的花括号，第一个成功的就用。
+        （括号匹配、转义、嵌套全部交给标准库，比手写栈更稳。）
+    """
+    t = (text or "").replace("```json", " ").replace("```", " ").strip()
+    for i, ch in enumerate(t):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = _JSON_DEC.raw_decode(t, i)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
 
 def _load_ai():
@@ -185,8 +213,11 @@ def normalize(raw):
     #   避免模型自由发挥污染筛选。
     for f, spec in QUALITATIVE_FIELDS.items():
         v = str(raw.get(f, "")).strip().lower()
-        out[f] = v if v in spec["values"] else (
-            "none" if f == "dual_role" else "na")
+        # ★ 2026-10-01：默认值改为读字段自己的 spec["default"]。
+        #   原来硬编码 `"none" if f == "dual_role" else "na"` —— 将来往
+        #   QUALITATIVE_FIELDS 里加字段（比如 study_type）就会被迫吃 "na"，
+        #   哪怕它在 spec 里声明了别的默认值。现在默认值属于数据，不属于代码。
+        out[f] = v if v in spec["values"] else spec.get("default", "na")
     return out
 
 
@@ -207,7 +238,7 @@ def normalize_titleonly(raw):
            "reason": str(raw.get("reason", ""))[:60], "tldr": ""}
     for f, spec in QUALITATIVE_FIELDS.items():
         vv = str(raw.get(f, "")).strip().lower()
-        out[f] = vv if vv in spec["values"] else ("none" if f == "dual_role" else "na")
+        out[f] = vv if vv in spec["values"] else spec.get("default", "na")
     return out
 
 
@@ -224,25 +255,48 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
     except Exception as e:
         print(f"  [Error] 无法加载本地视觉桥：{e}")
         return None
+    # ★ 2026-10-01【服务生命周期】：只有"本函数亲手启动的"服务才由本函数收掉。
+    #   原来 finally 里无条件 ai.stop_server() —— 如果这个 llama-server 是你
+    #   自己先起来干别的用的（ask_image.health() 一进来就是 True，压根不会走到
+    #   start_server），打分跑完照样被它杀掉。manual_ingest.py 一直是带
+    #   `started` 标志的，这里对齐。
+    #   ⚠️ start_server() 在**超时时会返回 False 却不杀进程**（见 download.py 的
+    #      同款注释）⇒ 只要"尝试过启动"，退出时就必须收，否则留下一个占着
+    #      几 GB 显存的孤儿。所以标志在调用前就置位。
+    _we_started = False
     if not ai.health():
         if ai.mineru_running():
             print("  [Error] MinerU 正在运行，与本地模型抢显存；本轮改用 DeepSeek")
             return None
         print("  正在启动本地 Qwen3.5-9B …")
+        _we_started = True
         if not ai.start_server():
             print("  [Error] 本地模型启动失败；本轮改用 DeepSeek")
+            # ★ 这条 return 在下面的 try 之外 ⇒ finally 覆盖不到它。
+            #   而 start_server() 在**超时时返回 False 却不杀进程** ⇒
+            #   这里必须自己收一次，否则留下一个占几 GB 显存的孤儿，
+            #   把后面所有需要显存的任务（含 MinerU）全部拖垮。
+            try:
+                ai.stop_server()
+            except Exception:
+                pass
             return None
+    else:
+        print("  [本地打分] 复用已在本机运行的服务（跑完不会关它）")
 
     total = len(papers)
     t0 = time.time()
     ok = fail = 0
+    complete = []                 # ★ 真正跑完推理的那些（含判为不相关的只标题篇）
+    consec_fail = 0
+    fused = None
     try:
         n_title_only = 0
         for idx, p in enumerate(papers, 1):
             title = p.get("title", "")
             abstract = p.get("summary", "") or ""
             # ★ 只有标题的走【相关性判断】，不打分（用户 2026-10-01 定）
-            title_only = (not abstract) or abstract.startswith("No abstract")
+            title_only = no_abstract(abstract)
             if title_only:
                 n_title_only += 1
             res = None
@@ -257,9 +311,30 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
                     time.sleep(0.4)
             if res:
                 p.update(res)
+                complete.append(p)
                 ok += 1
+                consec_fail = 0
             else:
                 fail += 1
+                consec_fail += 1
+
+            # ★ 2026-10-01【熔断】。服务中途 OOM/崩溃时，后面每一篇都会
+            #   "异常 → sleep 0.4 → 重试 → 再异常"，一路算失败。
+            #   原来这种情况下函数照样返回一个【非空的】前半段结果，
+            #   而 scoring.py 的判据是 `if scored:` ⇒ 上游认定"本地打分成功"，
+            #   后面几百篇连 DeepSeek 兜底都轮不到，**静默消失**。
+            #   现在：连续失败或失败率超线 ⇒ 返回 None，让上游走 DeepSeek。
+            #   （没跑完的那些【不会】被标 seen，次日会重新入池。）
+            if consec_fail >= FUSE_CONSEC_FAIL:
+                fused = f"连续 {consec_fail} 篇失败（第 {idx} 篇）"
+            elif idx >= FUSE_MIN_SAMPLE and fail / idx > FUSE_FAIL_RATE:
+                fused = f"失败率 {fail}/{idx} = {fail/idx:.0%} 超过 {FUSE_FAIL_RATE:.0%}"
+            if fused:
+                print(f"\n  [熔断] {fused} —— 判定本地服务异常中断")
+                print(f"         已成功 {ok} 篇（本批放弃，交给上游回退），"
+                      f"其余 {total - idx} 篇未处理、次日会重新入池")
+                return None
+
             if verbose and (idx % log_every == 0 or idx == total):
                 el = time.time() - t0
                 eta = el / idx * (total - idx)
@@ -267,46 +342,95 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
                       f"（其中只标题 {n_title_only} 篇，不打分）  "
                       f"已用 {el:.0f}s  预计剩余 {eta:.0f}s")
     finally:
-        ai.stop_server()
+        if _we_started:
+            ai.stop_server()
 
     el = time.time() - t0
-    n_scored = sum(1 for p in papers if "total_score" in p)
-    n_rel = sum(1 for p in papers if p.get("_title_only") and p.get("relevant"))
+    n_scored = sum(1 for p in complete if "total_score" in p)
+    n_rel = sum(1 for p in complete if p.get("_title_only") and p.get("relevant"))
+    n_irrel = sum(1 for p in complete if p.get("_title_only")
+                  and not p.get("relevant"))
     print(f"  [汇总] 本地打分完成：成功 {ok}/{total} 篇，耗时 {el:.0f}s "
           f"（{el/max(total,1):.2f} s/篇）")
     print(f"        其中【有摘要·打过四维分】{n_scored} 篇；"
-          f"【只标题·不打分】{n_title_only} 篇（判为相关 {n_rel} 篇）")
-    # 有分的、或只标题但判为相关的，都留下交给下游
-    return [p for p in papers if "total_score" in p
-            or (p.get("_title_only") and p.get("relevant"))]
+          f"【只标题·不打分】{n_title_only} 篇（相关 {n_rel}，不相关 {n_irrel}）")
+
+    # ★ 2026-10-01【返回值必须包含判为"不相关"的只标题文献】。
+    #   原来这里只留 `有分 or (只标题 and relevant)` ⇒ relevant=False 的
+    #   被直接从列表里剔除 ⇒ paper_radar 的 `mark_many(scored_papers,"seen")`
+    #   永远登不到它们 ⇒ 次日 filter_new 认不出 ⇒ **再走一遍粗筛 + 再喂一次
+    #   本地模型**，天天如此。而 COARSE_NO_ABSTRACT_BYPASS=True 正好保证
+    #   它们每天都能过粗筛，这个循环是稳定的。实测这类约几百篇/天。
+    #   现在返回【所有真正跑完推理的】；下游 titleonly_list 自己会用
+    #   `and p.get("relevant")` 把它们挡在简报之外，不会漏给用户。
+    #   （跑失败的那些不在 complete 里 —— 它们需要次日重试，不能登记。）
+    return complete
 
 
 # --------------------------------------------------------------- 自测
+# ★ 2026-10-01【改为离线静态样本】。原来这个自测去敲
+#   `api.openalex.org/works?search=...&mailto=test@example.com` ——
+#   而 OpenAlex 自 2026-02-13 起**强制要求 API Key**，匿名 mailto 礼貌池已废弃，
+#   不带头就全局 429。结果这个"独立自测"要么拿到空 results（等于什么都没测），
+#   要么在非 JSON 的错误页上 `.json()` 直接抛异常崩掉。
+#   自测的意义就是【不依赖外部服务】，所以样本直接内置。
+_TEST_SAMPLES = [
+    ("Preferential flow in macropore-dominated forest soils",
+     "Macropore flow and preferential flow paths were studied in forest soils. "
+     "Dye tracing showed that root channels and earthworm burrows dominate "
+     "infiltration, bypassing the soil matrix. A dual-permeability model was "
+     "fitted to the breakthrough curves.", "有摘要·优先流"),
+    ("Numerical investigation of rainfall infiltration in unsaturated slopes",
+     "A coupled rainfall infiltration and slope stability analysis is presented. "
+     "The Richards equation is solved for variably saturated flow, and the "
+     "factor of safety is computed with a limit equilibrium method. Results "
+     "show that the wetting front depth controls the timing of failure.",
+     "有摘要·降雨入渗"),
+    ("Effects of root reinforcement on shallow landslide susceptibility",
+     "Root tensile strength and root area ratio were measured for three species. "
+     "A root cohesion model was coupled to an infinite slope stability model "
+     "to assess regional landslide susceptibility.", "有摘要·边坡稳定"),
+    ("A new machine-learning surrogate for the Richards equation",
+     "We propose a physics-informed neural network surrogate for solving the "
+     "Richards equation in heterogeneous media, achieving a 100x speedup over "
+     "the finite element reference.", "有摘要·方法创新"),
+    ("Deep-sea hydrothermal vent geochemistry",
+     "Trace metal partitioning in hydrothermal plumes is examined using "
+     "samples from the Mid-Atlantic Ridge.", "有摘要·不相关（应给低分）"),
+    ("A numerical study of Tafel slope in electrocatalysis",
+     "The Tafel slope of the oxygen evolution reaction was measured on "
+     "nickel-iron oxide electrodes.", "有摘要·歧义 'slope'（应给低分）"),
+    ("Landslide hazard mapping in the Three Gorges Reservoir area", "", "只标题·相关"),
+    ("Seismic landslide dynamics and run-out distance of rock avalanches", "",
+     "只标题·黑名单（应判不相关）"),
+    ("Long-term survival of lichen communities on urban walls", "",
+     "只标题·不相关"),
+]
+
+
 def _test():
-    import requests
-    q = "preferential flow macropore slope rainfall infiltration"
-    url = ("https://api.openalex.org/works?search=" + requests.utils.quote(q) +
-           "&per_page=6&mailto=test@example.com")
-    works = requests.get(url.replace("per_page", "per-page"), timeout=30).json().get("results", [])
-    papers = []
-    for w in works:
-        inv = w.get("abstract_inverted_index")
-        if not inv:
-            continue
-        pos = {}
-        for word, idxs in inv.items():
-            for i in idxs:
-                pos[i] = word
-        papers.append({"title": w.get("title") or "",
-                       "summary": " ".join(pos[k] for k in sorted(pos))[:1500],
-                       "source": "test"})
-    print(f"自测：{len(papers)} 篇")
-    out = score_all(papers, log_every=1)
+    papers = [{"title": t, "summary": (s or "No abstract available"),
+               "source": "self-test", "data_source": "self-test"}
+              for t, s, _lab in _TEST_SAMPLES]
+    print(f"自测（离线样本）：{len(papers)} 篇")
+    for _t, _s, lab in _TEST_SAMPLES:
+        print("   · %s" % lab)
+    print()
+    out = score_all(papers, log_every=25)
     if out is None:
-        print("失败"); return 1
+        print("失败：本地打分不可用（服务起不来 / 中途熔断）")
+        return 1
+    n = 0
     for p in out:
-        print(f"  {p['total_score']:2d}/40  {p['title'][:52]}")
-        print(f"        {p['reason']}")
+        if p.get("_title_only"):
+            print(f"   [只标题] {'相关' if p.get('relevant') else '不相关'}  "
+                  f"{p['title'][:50]}")
+            print(f"            {p.get('reason','')}")
+        else:
+            n += 1
+            print(f"   {p['total_score']:2d}/40  {p['title'][:50]}")
+            print(f"            {p.get('reason','')}")
+    print(f"\n共 {len(out)} 篇返回（其中 {n} 篇有四维分）")
     return 0
 
 

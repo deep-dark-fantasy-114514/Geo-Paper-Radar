@@ -214,7 +214,7 @@ def score_all_papers(papers, phase_label="DeepSeek"):
         #   英文标题去判"优先流机制/方法创新性"，必然幻觉；而且【不打 _title_only
         #   标签】，主程序预设的"只标题文献走独立简报与待下载清单"就彻底失效，
         #   导致换打分器后业务行为不一致。
-        if (not abstract) or str(abstract).startswith("No abstract"):
+        if no_abstract(abstract):      # ★ 统一判空（带 strip）
             result = score_titleonly_with_deepseek(title)
             if result is None:
                 print(f"  [跳过] 该篇相关性判断失败，已跳过")

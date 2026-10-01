@@ -254,7 +254,7 @@ def fetch_crossref(queries, days=7, rows=200, per_query=True, max_total=800):
                        min_gap=1.0)
         items = ((d or {}).get("message") or {}).get("items", [])
         got = [p for p in (_cr_to_paper(x) for x in items) if p]
-        ab = sum(1 for p in got if p["summary"] != "No abstract available")
+        ab = sum(1 for p in got if not no_abstract(p))
         print(f"    取到 {len(got)} 篇（有摘要 {ab}）")
         out.extend(got)
         if len(out) >= max_total:
@@ -343,7 +343,7 @@ def fetch_openalex_dissertations(queries, days=365, per_query=60, max_total=200)
                                "mailto": MAILTO}, min_gap=1.0)
         got = [p for p in (_oa_to_paper(w, tag="OpenAlex-Diss")
                            for w in ((d or {}).get("results") or [])) if p]
-        ab = sum(1 for p in got if p["summary"] != "No abstract available")
+        ab = sum(1 for p in got if not no_abstract(p))
         print(f"    取到 {len(got)} 篇（有摘要 {ab}）")
         out.extend(got)
         if len(out) >= max_total:
@@ -490,7 +490,7 @@ def enrich_abstracts(papers, max_lookups=120):
     # ★ 已经来自 Crossref 的就别再问 Crossref 了——它没有就是没有，
     #   再查一遍纯属浪费配额。只补【从别的源来的、那边没摘要的】。
     todo = [p for p in papers
-            if (p.get("summary") or "").startswith("No abstract")
+            if no_abstract(p)
             and p.get("doi")
             and p.get("data_source") != "Crossref"][:max_lookups]
     if not todo:
@@ -571,7 +571,7 @@ def fetch_abstract_from_web(doi, timeout=25):
 def enrich_abstracts_web(papers, max_lookups=40, min_gap=1.5):
     """Crossref 补不到时，改从出版社落地页抓（会尊重间隔，失败静默跳过）。"""
     todo = [p for p in papers
-            if (p.get("summary") or "").startswith("No abstract")
+            if no_abstract(p)
             and p.get("doi")
             and not p.get("_web_tried")][:max_lookups]
     if not todo:
@@ -674,7 +674,7 @@ def _test():
     print("\n⑥ 摘要补全")
     enrich_abstracts(ded, max_lookups=15)
 
-    ab = sum(1 for p in ded if not p["summary"].startswith("No abstract"))
+    ab = sum(1 for p in ded if not no_abstract(p))
     print(f"\n最终摘要覆盖：{ab}/{len(ded)} = {100*ab/max(len(ded),1):.0f}%")
     return 0
 

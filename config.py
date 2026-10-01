@@ -439,6 +439,25 @@ def safe_filename(text, max_len=40):
     return safe
 
 
+def no_abstract(p_or_summary):
+    """判断"这篇没有摘要"。
+
+    ★ 2026-10-01：**全仓唯一实现**。原来 9 处各写一遍，其中只有
+      `filters._no_abstract` 那份带 `.strip()`，另外 8 处（local_scorer /
+      scoring / paper_radar / sources / output）都是裸 `startswith`。
+      摘要字段里混入前导换行或空格时（Crossref 的 JATS 剥离、XML 转换、
+      人工粘贴都可能产生 `"\\nNo abstract available"`），那 8 处会把它
+      当成"有摘要"，送去跑四维打分 ⇒ **凭空产出一个虚假分数**。
+
+    兼容两种入参：paper 字典，或摘要字符串本身。
+    """
+    s = p_or_summary
+    if isinstance(s, dict):
+        s = s.get("summary")
+    s = (s or "").strip()
+    return (not s) or s.startswith("No abstract")
+
+
 def norm_title(title):
     """标题归一化：**剥离 XML 标签 → 压空白 → 去标点 → 转小写**。
 

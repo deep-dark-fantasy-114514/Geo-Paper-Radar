@@ -54,7 +54,7 @@ def generate_ris_file(paper):
             _doi = _m.group(0) if _m else ""
         if _doi:
             ris_lines.append(f"DO  - {_doi}")
-        if summary and not summary.startswith("No abstract"):
+        if summary and not no_abstract(summary):   # ★ 统一判空（带 strip）
             ris_lines.append("AB  - " + summary)
         ris_lines.append(f"KW  - Geo_Paper_Radar_V3.0")
         ris_lines.append(f"KW  - Source:{ds}")

@@ -223,8 +223,7 @@ def main():
     if ABSTRACT_ENRICH_CROSSREF or ABSTRACT_ENRICH_WEB:
         try:
             import sources as _src
-            n0 = sum(1 for p in deepseek_input
-                     if (p.get("summary") or "").startswith("No abstract"))
+            n0 = sum(1 for p in deepseek_input if no_abstract(p))
             print(f"\n  [摘要补全] 待打分 {len(deepseek_input)} 篇，"
                   f"其中无摘要 {n0} 篇")
             if n0:
@@ -234,8 +233,7 @@ def main():
                 if ABSTRACT_ENRICH_WEB:
                     _src.enrich_abstracts_web(deepseek_input,
                                               max_lookups=ABSTRACT_ENRICH_WEB)
-                n1 = sum(1 for p in deepseek_input
-                         if (p.get("summary") or "").startswith("No abstract"))
+                n1 = sum(1 for p in deepseek_input if no_abstract(p))
                 print(f"  [摘要补全] 无摘要 {n0} → {n1} 篇")
         except Exception as e:
             print(f"  [警告] 摘要补全失败：{type(e).__name__}: {e}")

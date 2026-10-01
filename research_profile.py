@@ -99,16 +99,22 @@ QUALITATIVE_FIELDS = {
         "values": ["adverse", "beneficial", "both", "none"],
         "note": "adverse=讲不利作用(你的重点) / beneficial=讲排水有利(对照文献) "
                 "/ both=两面都讲 / none=不涉及优先流的作用",
+        # ★ 2026-10-01 新增 default：模型答了非法值 / 干脆没答时用它兜底。
+        #   原来这个兜底硬编码在 local_scorer 里（`"none" if f=="dual_role"
+        #   else "na"`）⇒ 以后往这里加字段只会拿到 "na"。现在默认值属于数据。
+        "default": "none",
     },
     "scale": {
         "desc": "研究尺度",
         "values": ["pore", "slope", "catchment", "regional", "na"],
         "note": "直接对应你技术路线的第 4 步外推",
+        "default": "na",
     },
     "approach": {
         "desc": "主要方法",
         "values": ["numerical", "experimental", "theoretical", "review",
                    "data-driven", "na"],
         "note": "你是数值模拟路线，同路线的参考文献优先级更高",
+        "default": "na",
     },
 }

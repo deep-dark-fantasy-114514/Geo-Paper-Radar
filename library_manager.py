@@ -36,7 +36,7 @@ except Exception:
 from config import (BASE_DIR, PDF_INBOX_DIR, MANUAL_DROP_DIR, RENAMER, ASK_IMAGE,
                     atomic_copy_into, unique_path)
 from processed import key_of                      # noqa: F401 (对外仍以 lm.key_of 暴露)
-from filters import _no_abstract as has_no_abstract   # noqa: F401
+from config import no_abstract as has_no_abstract     # noqa: F401
 
 LIBRARY_DIR = os.path.join(BASE_DIR, "Library")
 DIGEST_DIR = os.path.join(LIBRARY_DIR, "简报")

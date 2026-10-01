@@ -11,9 +11,8 @@ from config import *
 
 
 def _no_abstract(paper):
-    """OpenAlex 对闭源论文不给摘要时，summary 会被填成 "No abstract available"。"""
-    s = (paper.get("summary") or "").strip()
-    return (not s) or s.startswith("No abstract")
+    """见 config.no_abstract（全仓唯一实现）。薄封装，本文件内的调用点保持不变。"""
+    return no_abstract(paper)
 
 
 
