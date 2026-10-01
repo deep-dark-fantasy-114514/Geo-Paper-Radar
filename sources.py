@@ -48,7 +48,11 @@ try:
 except Exception:
     pass
 
-MAILTO = "781005412@qq.com"
+# ★ 2026-10-01：原来硬编码私有邮箱。改成优先读环境变量，
+#   与 config.SMTP_SENDER 保持一致（换邮箱只需改 .env）。
+MAILTO = (os.getenv("PAPER_RADAR_MAILTO", "").strip()
+          or os.getenv("SMTP_SENDER", "").strip()
+          or "781005412@qq.com")
 UA = ("GeoPaperRadar/3.1 (academic literature radar; "
       "mailto:%s)" % MAILTO)
 HEADERS = {"User-Agent": UA, "Accept": "application/json"}
@@ -69,7 +73,9 @@ def _auth_headers(url):
     return {}
 
 # 与 paper_radar.CHINESE_JOURNALS_ISSN 保持一致
-CHINESE_ISSN = {"1000-6915", "1000-4548", "1000-2383"}
+# ★ 2026-10-01：原来这里又抄了一份 ISSN。改为直接复用 config 里的那一份，
+#   避免"在 config 加了新刊、这里不同步"的问题。
+CHINESE_ISSN = set(CHINESE_JOURNALS_ISSN)
 
 # 死掉的 RSS 源不再重试；改用 issn 走 API 拿
 DEAD_RSS = {
@@ -92,7 +98,7 @@ _last_call = [0.0]
 # 1. 统一的礼貌请求
 # ══════════════════════════════════════════════
 def polite_get(url, params=None, timeout=45, retries=4, base_delay=1.5,
-               min_gap=1.0, expect_json=True):
+               min_gap=1.0, expect_json=True, headers_override=None):
     """带指数退避的 GET。
 
     · 429 / 500 / 502 / 503 / 504 → 退避重试，优先遵守 Retry-After 头
@@ -109,8 +115,10 @@ def polite_get(url, params=None, timeout=45, retries=4, base_delay=1.5,
     for attempt in range(1, retries + 1):
         try:
             _last_call[0] = time.time()
-            r = _session.get(url, params=params, timeout=timeout,
-                             headers=_auth_headers(url))
+            _h = dict(_auth_headers(url))
+            if headers_override:
+                _h.update(headers_override)   # 单次覆盖（如 arXiv 要 XML）
+            r = _session.get(url, params=params, timeout=timeout, headers=_h)
             if r.status_code in (429, 500, 502, 503, 504):
                 # ★ OpenAlex 的 429 里 retryAfter 可能长达数万秒（等下一天）——
                 #   那种情况重试没意义，直接放弃并说明原因，别把整批拖死。
@@ -163,8 +171,9 @@ def strip_jats(s):
         return ""
     s = re.sub(r"</?(jats:)?(p|sec|title|italic|bold|sub|sup|xref|br)[^>]*>", " ", s)
     s = _TAG.sub(" ", s)
-    s = (s.replace("&lt;", "<").replace("&gt;", ">")
-          .replace("&amp;", "&").replace("&quot;", '"').replace("&#x2010;", "-"))
+    # ★ 2026-10-01：原来手写替换 5 个实体，漏掉绝大多数
+    #   （&#8211; &plusmn; &mu; &ndash; …）。改用标准反转义。
+    s = _html.unescape(s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -394,6 +403,9 @@ def fetch_arxiv(queries, max_results=100):
             "http://export.arxiv.org/api/query",
             params={"search_query": q, "start": 0, "max_results": max_results,
                     "sortBy": "submittedDate", "sortOrder": "descending"},
+            # ★ arXiv 返回 XML，而模块级 _session 的默认头是 Accept: application/json
+            #   —— 显式覆盖，免得某些网关按 406 Not Acceptable 拒掉。
+            headers_override={"Accept": "application/atom+xml,text/xml,*/*"},
             expect_json=False, min_gap=3.0)      # arXiv 要求 ≥3 秒
         if not txt:
             continue
@@ -611,6 +623,11 @@ def dedupe_by_title(papers):
     for p in papers:
         t = _norm_title_key(p.get("title"))
         d = norm_doi(p.get("doi"))
+        # ★ 2026-10-01：标题和 DOI 都空的脏记录直接丢掉。
+        #   原来 `if (t and t in seen_t) or (d and d in seen_d)` 在 t=d="" 时为 False，
+        #   于是这种记录会【绕过去重逻辑】被加进结果里。
+        if not t and not d:
+            continue
         if (t and t in seen_t) or (d and d in seen_d):
             continue
         if t:
@@ -625,12 +642,12 @@ def dedupe_by_title(papers):
 # 自测
 # ══════════════════════════════════════════════
 def _test():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "ask_image",
-        r"C:\Users\zihao\.claude\skills\local-vision\scripts\ask_image.py")
-    ai = importlib.util.module_from_spec(spec)
+    r"""自测：跑一遍 Crossref / 学位论文 / arXiv 三个源。
 
+    不需要视觉模型（那部分是打分器的事），所以这里【不加载任何本地路径】——
+    原版留了一句写死的 `C:\Users\zihao\...` 路径和一个没用到的变量，
+    拿到别的机器上就是脏代码。
+    """
     print("=" * 70)
     print("sources.py 自测")
     print("=" * 70)
@@ -757,14 +774,8 @@ class OpenAlexFetcher:
 
     def __init__(self, mailto):
         self.mailto = mailto
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64 x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        })
+        # 不建 self.session —— 所有请求都走模块级 polite_get（它自带 _session
+        # 和退避重试）。原来这里建的 Session 从不发请求，纯摆设。
 
     def _build_search_url(self, query, page=1):
         """用单个关键词构造 OpenAlex 查询"""
@@ -789,11 +800,10 @@ class OpenAlexFetcher:
         """
         url = self._build_search_url(query)
         try:
-            import sys as _sys
-            if BASE_DIR not in _sys.path:
-                _sys.path.insert(0, BASE_DIR)
-            import sources as _src
-            data = _src.polite_get(url, min_gap=1.0, retries=5)
+            # ★ 2026-10-01：原来在方法里 `import sources as _src` 调自己——
+            #   polite_get 就是本模块的顶层函数，直接调即可。
+            #   （那段"改 sys.path 再自导入"是打补丁留下的，已删。）
+            data = polite_get(url, min_gap=1.0, retries=5)
             if data is None:
                 return [], 0
             papers = []
@@ -898,294 +908,16 @@ class OpenAlexFetcher:
             # 提取年份
             pub_year = work.get("publication_year", datetime.now().year)
 
-            # 检查是否为中文核心期刊
-            is_chinese = any(issn.strip() in CHINESE_JOURNALS_ISSN for issn in issn_list)
-
-            return {
-                "title": title,
-                "link": link,
-                "summary": abstract or "No abstract available",
-                "source": journal_name,
-                "data_source": "OpenAlex",
-                "doi": doi,
-                "authors": authors,
-                "year": pub_year,
-                "issn": issn_list,
-                "is_chinese_journal": is_chinese,
-                "openalex_id": openalex_url,
-                "oa_pdf_url": oa_pdf_url,     # ★ 新增：OA PDF 直链（可为空）
-                "is_oa": is_oa,               # ★ 新增：是否开放获取
-            }
-
-        except Exception as e:
-            print(f"  [Warning] 解析 OpenAlex 条目失败: {e}")
-            return None
-
-    @staticmethod
-    def _extract_abstract(inverted_index):
-        """将 OpenAlex 的倒排索引摘要还原为纯文本"""
-        if not inverted_index:
-            return ""
-        # 按位置排序
-        word_positions = []
-        for word, positions in inverted_index.items():
-            for pos in positions:
-                word_positions.append((pos, word))
-        word_positions.sort(key=lambda x: x[0])
-        return " ".join(word for _, word in word_positions)
-
-
-# ══════════════════════════════════════════════
-# 5. 模块三：两阶段过滤（V3.0 核心）
-# ══════════════════════════════════════════════
-
-
-# ══════════════════════════════════════════════
-# 以下从 paper_radar.py 拆入（2026-10-01，逐字搬运，未改逻辑）
-# ══════════════════════════════════════════════
-
-def fetch_rss_with_retry(url, max_retries=3):
-    session = requests.Session()
-    session.headers.update(get_chrome_headers())
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"  [尝试 {attempt}/{max_retries}] 正在请求 {url}")
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            feed = feedparser.parse(resp.content)
-            if feed.bozo and not feed.entries:
-                print(f"  [Warning] RSS 解析异常: {feed.bozo_exception}")
-                continue
-            return feed
-        except requests.exceptions.Timeout:
-            print(f"  [Warning] 请求超时（尝试 {attempt}/{max_retries}）")
-        except requests.exceptions.RequestException as e:
-            print(f"  [Warning] 请求失败: {e}（尝试 {attempt}/{max_retries}）")
-        except Exception as e:
-            print(f"  [Warning] 未知错误: {e}（尝试 {attempt}/{max_retries}）")
-        if attempt < max_retries:
-            wait = 2 ** attempt
-            print(f"  [Info] 等待 {wait}s 后重试...")
-            time.sleep(wait)
-    return None
-
-
-def fetch_papers_from_rss():
-    """RSS 抓取，返回 list[dict]"""
-    all_papers = []
-    print("=" * 60)
-    print("【RSS 源】文献抓取")
-    print("=" * 60)
-
-    for url in RSS_SOURCES:
-        name = infer_journal_name(url)
-        print(f"\n[进度] 正在抓取 {name} ...")
-        feed = fetch_rss_with_retry(url)
-        if feed is None or not feed.entries:
-            print(f"  [Warning] 跳过 {name}：抓取失败或无有效条目")
-            continue
-        count = 0
-        for entry in feed.entries:
-            if not is_within_hours(entry, FETCH_HOURS):
-                continue
-            title = entry.get("title", "").strip()
-            link = entry.get("link", "").strip()
-            summary = entry.get("summary", "") or entry.get("description", "") or ""
-            if not title:
-                continue
-            all_papers.append({
-                "title": title,
-                "link": link,
-                "summary": summary,
-                "source": name,
-                "data_source": "RSS",
-            })
-            count += 1
-        print(f"  [完成] {name}: 获取 {count} 篇新文献")
-
-    # 标题去重
-    seen = set()
-    unique = []
-    for p in all_papers:
-        t = p["title"].strip().lower()
-        if t not in seen:
-            seen.add(t)
-            unique.append(p)
-    print(f"\n[汇总] RSS 共抓取 {len(all_papers)} 篇，去重后 {len(unique)} 篇")
-    return unique
-
-
-# ══════════════════════════════════════════════
-# 4. 模块二：OpenAlex 数据源（V3.0 新增）
-# ══════════════════════════════════════════════
-
-
-class OpenAlexFetcher:
-    """
-    OpenAlex API 文献抓取器（方案B：纯文本搜索，无 concept_id 硬限制）
-    """
-
-    def __init__(self, mailto):
-        self.mailto = mailto
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64 x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        })
-
-    def _build_search_url(self, query, page=1):
-        """用单个关键词构造 OpenAlex 查询"""
-        from_date = (datetime.now() - timedelta(days=OPENALEX_DAYS_LOOKBACK)).strftime("%Y-%m-%d")
-        params = {
-            "filter": f"from_publication_date:{from_date}",
-            # 使用 title_and_abstract.search 限定在标题和摘要中搜索
-            "search": query,
-            "sort": "publication_date:desc",
-            "per_page": OPENALEX_PER_PAGE,
-            "page": page,
-            "mailto": self.mailto,
-        }
-        return f"{OPENALEX_BASE_URL}/works?{urllib.parse.urlencode(params)}"
-
-    def _fetch_single_query(self, query):
-        """执行单个关键词查询并解析结果。
-
-        ★ 2026-10-01 修：原来用裸 `requests.get`，**完全没有退避重试** ——
-        实测 OpenAlex 一限流就把 6 组查询全打成 0 篇，**910 篇覆盖悄无声息地没了**。
-        现在改走 `sources.polite_get()`：指数退避 + 读 Retry-After + 查询间隔 ≥1s。
-        """
-        url = self._build_search_url(query)
-        try:
-            import sys as _sys
-            if BASE_DIR not in _sys.path:
-                _sys.path.insert(0, BASE_DIR)
-            import sources as _src
-            data = _src.polite_get(url, min_gap=1.0, retries=5)
-            if data is None:
-                return [], 0
-            papers = []
-            for work in data.get("results", []):
-                paper = self._parse_work(work)
-                if paper:
-                    papers.append(paper)
-            return papers, (data.get("meta") or {}).get("count", 0)
-        except Exception as e:
-            print(f"  [Warning] 查询 '{query[:20]}' 失败: {e}")
-            return [], 0
-
-    def fetch_papers(self):
-        """
-        从 OpenAlex 抓取文献 — 多关键词分次查询后合并
-        策略：用 6 个核心英文词分别查询，合并去重
-        目的：避免 AND 逻辑太重导致空结果
-        """
-        all_papers = []
-        print("\n" + "=" * 60)
-        print("【OpenAlex 源】大规模文献检索（方案B：多关键词分次查询）")
-        print("=" * 60)
-
-        # 核心查询词（每个单独查询，OpenAlex 空格=AND 所以每个词尽量短）
-        queries = [
-            "landslide",
-            "slope stability",
-            "rainfall infiltration",
-            "preferential flow",
-            "debris flow",
-            "unsaturated soil",
-        ]
-
-        total_estimated = 0
-        for q_idx, query in enumerate(queries, 1):
-            print(f"\n[进度] 查询 ({q_idx}/{len(queries)}): '{query}'")
-            papers, count = self._fetch_single_query(query)
-            total_estimated += count
-            if papers:
-                for p in papers:
-                    # 标记具体由哪个关键词命中
-                    p["openalex_query"] = query
-                all_papers.extend(papers)
-            print(f"  [完成] 获取 {len(papers)} 篇（OpenAlex 估计 {count} 篇）")
-
-        # 全局去重（按标题）
-        seen_titles = set()
-        unique_papers = []
-        for p in all_papers:
-            t = p["title"].strip().lower()
-            if t and t not in seen_titles:
-                seen_titles.add(t)
-                unique_papers.append(p)
-
-        print(f"\n[汇总] 多查询合并: {len(all_papers)} 篇 → 去重后 {len(unique_papers)} 篇")
-        print(f"  [估计] OpenAlex 总结果数约 {total_estimated} 篇（含跨查询重复）")
-        return unique_papers
-
-    def _parse_work(self, work):
-        """
-        解析单篇 OpenAlex work 对象，转换为统一格式
-        """
-        try:
-            title = work.get("title", "").strip()
-            if not title:
-                return None
-
-            # 提取 DOI / URL
-            # ★ 2026-10-01 更正：原变量名 pdf_url 名不副实——它取的其实是
-            #   【落地页】(landing_page_url)，从来不是 PDF 直链。已改名避免误解。
-            doi = work.get("doi", "") or ""
-            openalex_url = work.get("id", "") or ""
-            primary_location = work.get("primary_location", {}) or {}
-            landing_url = primary_location.get("landing_page_url", "") or ""
-
-            link = doi or landing_url or openalex_url
-
-            # ★ 2026-10-01 新增：取真正的 OA PDF 直链（用于自动下载）
-            best_oa = work.get("best_oa_location") or {}
-            oa_info = work.get("open_access") or {}
-            oa_pdf_url = (best_oa.get("pdf_url") or
-                          oa_info.get("oa_url") or "").strip()
-            is_oa = bool(oa_info.get("is_oa")) or bool(oa_pdf_url)
-
-            # 提取摘要（OpenAlex 的 abstract_inverted_index）
-            abstract = self._extract_abstract(work.get("abstract_inverted_index", {}))
-
-            # 提取期刊信息
-            source_obj = primary_location.get("source", {}) or {}
-            journal_name = source_obj.get("display_name", "") or "Unknown"
-            issn_list = source_obj.get("issn", []) or []
-
-            # 提取作者
-            authorships = work.get("authorships", []) or []
-            authors = []
-            for a in authorships[:10]:
-                author_obj = a.get("author", {}) or {}
-                name = author_obj.get("display_name", "")
-                if name:
-                    authors.append(name)
-
-            # 提取年份
-            pub_year = work.get("publication_year", datetime.now().year)
-
-            # 检查是否为中文核心期刊
-            is_chinese = any(issn.strip() in CHINESE_JOURNALS_ISSN for issn in issn_list)
-
-            return {
-                "title": title,
-                "link": link,
-                "summary": abstract or "No abstract available",
-                "source": journal_name,
-                "data_source": "OpenAlex",
-                "doi": doi,
-                "authors": authors,
-                "year": pub_year,
-                "issn": issn_list,
-                "is_chinese_journal": is_chinese,
-                "openalex_id": openalex_url,
-                "oa_pdf_url": oa_pdf_url,     # ★ 新增：OA PDF 直链（可为空）
-                "is_oa": is_oa,               # ★ 新增：是否开放获取
-            }
+            # ★ 2026-10-01：改用 pack() 统一打包。
+            #   原来这里【手工拼字典】，DOI 直接塞原始值（"https://doi.org/10.xxx"），
+            #   而 _oa_to_paper 走 pack → norm_doi（"10.xxx"）——
+            #   两个源产出的 DOI 格式不一致，dedupe_by_title 按 DOI 匹配时就失效了。
+            #   现在两边走同一条路，字段结构与清洗标准完全统一。
+            return pack(title=title, link=link, summary=abstract,
+                        source=journal_name, data_source="OpenAlex",
+                        doi=doi, authors=authors, year=pub_year,
+                        issn=issn_list, oa_pdf_url=oa_pdf_url, is_oa=is_oa,
+                        extra={"openalex_id": openalex_url})
 
         except Exception as e:
             print(f"  [Warning] 解析 OpenAlex 条目失败: {e}")
