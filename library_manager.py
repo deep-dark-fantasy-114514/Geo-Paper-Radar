@@ -193,13 +193,18 @@ def has_no_abstract(p):
 
 
 def key_of(paper):
-    """文献的唯一标识：优先 DOI，其次规范化标题。用于跨清单匹配。"""
+    """文献的唯一标识：优先 DOI，其次规范化标题。用于跨清单匹配。
+
+    ⚠️ 必须与 `processed.key_of()` **逐字一致** —— 两边算出的键不同的话，
+       去重表就认不出同一篇，跨天/跨源重复又会冒出来。
+    """
     doi = (paper.get("doi") or "").strip().lower()
-    doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
     if doi:
         return "doi:" + doi
-    t = re.sub(r"\s+", " ", (paper.get("title") or "").strip().lower())
-    t = re.sub(r"[^0-9a-z一-鿿 ]", "", t)
+    t = (paper.get("title") or "").strip().lower()
+    t = re.sub(r"<[^>]+>", " ", t)                    # 去掉 XML 标签
+    t = re.sub(r"[^0-9a-z一-鿿 ]", "", re.sub(r"\s+", " ", t))
     return "title:" + t[:120]
 
 

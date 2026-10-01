@@ -52,6 +52,32 @@ SYSTEM = ("你是一位资深地学审稿专家，专攻地质灾害与水文地
 def build_prompt(title, abstract):
     dims_txt = "\n".join(
         f"{i}. {k}（{d}）0-10 分" for i, (k, d) in enumerate(DIMS, 1))
+    no_ab = (not abstract) or abstract.startswith("No abstract")
+    if no_ab:
+        # ★ 2026-10-01：闭源论文常拿不到摘要（Elsevier/Wiley 不交摘要给任何索引）。
+        #   这类【只看标题】的，要明确告诉模型"没有摘要是正常的，别因此拒答"，
+        #   并让它对不确定的给低分而不是猜。
+        return (
+            f"{SYSTEM}\n\n"
+            f"下面这篇论文**只有标题，没有摘要**（闭源期刊未公开摘要），"
+            f"请**仅凭标题**判断它与【碎石土边坡优先流入渗】的相关程度。\n\n"
+            f"按四个维度打分（每维 0-10 整数）：\n{dims_txt}\n\n"
+            f"只有标题时的评分规则：\n"
+            f"- 标题里明确出现边坡/滑坡/降雨入渗/优先流/非饱和土/渗流的 ⇒ 给 5-8 分\n"
+            f"- 标题明显是本方向的常规研究（不含新意）⇒ 方法创新给 1-3 分\n"
+            f"- 标题与本方向**看不出关系**的 ⇒ **四个维度都给 0-1 分**，不要猜\n"
+            f"- ⚠️ 注意歧义词：'slope' 可能是电化学的 Tafel slope，"
+            f"'soil' 可能是土壤生态学，'flow' 可能是流体力学——"
+            f"这些【不是】我们方向的，给 0-1 分\n\n"
+            f"【论文标题】{title}\n"
+            f"【摘要】（无）\n\n"
+            f"只输出 JSON，不要解释、不要 markdown 代码块：\n"
+            '{"slope_stability":<int>,"rainfall_infiltration":<int>,'
+            '"preferential_flow":<int>,"method_innovation":<int>,'
+            '"reason":"<20字以内中文理由；若判为无关就写 标题看不出相关性>",'
+            '"tldr":"<一句话>"}'
+            "\n不要输出 total_score，我会自己加。"
+        )
     return (
         f"{SYSTEM}\n\n"
         f"请按四个维度给下面这篇论文打分（每维 0-10 整数）：\n{dims_txt}\n\n"

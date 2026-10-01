@@ -51,10 +51,17 @@ SMTP_RECEIVER = os.getenv("SMTP_RECEIVER", "")
 
 # ---- RSS 源 ----
 RSS_SOURCES = [
-    "https://link.springer.com/search.rss?facet-journal-id=10346&channel-name=Landslides",
     "https://rss.sciencedirect.com/publication/science/00137952",
     "https://rss.sciencedirect.com/publication/science/0169555X",
-    "https://agupubs.onlinelibrary.wiley.com/action/showFeed?jc=1944-7973&type=etoc&feed=rss"
+]
+
+# ★ 2026-10-01 拉黑：下面两个 RSS 已【确认死亡】，每次跑都失败重试浪费时间。
+#   两个期刊改由 Crossref 按 issn 拿最新目录（见 sources.JOURNAL_ISSN），覆盖更全。
+DEAD_RSS_BLACKLIST = [
+    # HTTP 200 但返回 HTML（RSS 端点已撤/被拦）
+    "https://link.springer.com/search.rss?facet-journal-id=10346&channel-name=Landslides",
+    # HTTP 404，端点已撤
+    "https://agupubs.onlinelibrary.wiley.com/action/showFeed?jc=1944-7973&type=etoc&feed=rss",
 ]
 
 # ---- OpenAlex 配置 ----
@@ -140,10 +147,13 @@ PDF_DOWNLOAD_ENABLED = LOCAL_MODE   # 云端下载了也没处放，直接关掉
 
 SCORER = os.getenv("PAPER_RADAR_SCORER",
                    "local" if LOCAL_MODE else "deepseek")   # local | deepseek
-MAX_CANDIDATES = 500          # 送入打分的候选上限（仅对 local 生效）
-COARSE_MIN_HITS = 1           # 粗筛命中阈值。旧值是 2（实测只剩 79/1033 篇，丢掉 93%）
-                              #   1 → 270 篇（约 5 分钟）；0 → 全部 1033 篇（约 19 分钟）
-                              #   本地打分免费，想更彻底就把这个改成 0
+MAX_CANDIDATES = 800          # 送入打分的候选上限（仅对 local 生效）
+                              # 2026-10-01 由 500 提到 800：接入 Crossref 后候选变多，
+                              # 再加上"无摘要全收"，500 会被撞满切掉正经论文
+COARSE_MIN_HITS = 1           # 粗筛命中阈值（只作用于【有摘要】的）
+COARSE_NO_ABSTRACT_BYPASS = True   # ★ 无摘要的（多是闭源）不卡关键词，全放行
+                                   #   让本地模型看标题判 —— 实测能救回 440 篇被误杀的
+                                   #   代价：多约 8 分钟打分（免费）
 AUTO_RENAME_PDF = LOCAL_MODE      # 下载后用本地视觉模型重命名为【中文名】
 AUTO_FILE_TO_LIBRARY = LOCAL_MODE  # 归档到 Library\<主题>\ 并复制一份到 PDF_Inbox\
 
@@ -154,9 +164,35 @@ AUTO_FILE_TO_LIBRARY = LOCAL_MODE  # 归档到 Library\<主题>\ 并复制一份
 #       本机开机后把这些候选合并进自己的池子，再跑完整流程。
 #       ⇒ 笔记本睡几天也不漏文献。
 HARVEST_MODE = os.getenv("PAPER_RADAR_MODE", "").lower() == "harvest"
+
+# ---- ★ 2026-10-01 新增：多源检索 ----
+# 实测：Crossref 单查询 55,505 条，其中【91% 是 OpenAlex 没有的】⇒ 最大增量。
+# 两个 RSS 源（Springer Landslides / Wiley WRR）已死，改用 issn 走 Crossref 拿目录。
+USE_CROSSREF = True
+CROSSREF_QUERIES = [
+    "landslide rainfall",
+    "slope stability unsaturated soil",
+    "preferential flow macropore",
+    "rainfall infiltration slope",
+    "debris flow",
+    "unsaturated soil hydraulic",
+]
+CROSSREF_ROWS = 200           # 每组查询取多少（Crossref 单次硬上限 1000）
+USE_ARXIV = False             # 预印本，地学覆盖小，默认关
+
+# ---- ★ 摘要补全 ----
+# 背景：闭源论文在 OpenAlex 的摘要覆盖只有约 24%（Elsevier/Wiley 不交摘要给 Crossref）。
+#   · Crossref 补：对这一领域实测 0/25 —— Elsevier/Springer 根本没交，白搭但便宜
+#   · 网页补    ：只对 Copernicus 这类平台有效，Elsevier/Springer 有反爬
+# ⇒ 两条都留着但设上限，别为低产出耗时间。真正的希望是 Semantic Scholar（需 key）。
+ABSTRACT_ENRICH_CROSSREF = 60   # 去 Crossref 查几篇（每篇约 0.4 s）
+ABSTRACT_ENRICH_WEB = 20        # 去出版社落地页抓几篇（每篇约 1.5 s）
 HARVEST_DIR = os.path.join(BASE_DIR, "harvest")
 HARVEST_KEEP_DAYS = 14        # 本地只回捞最近 N 天的云端候选
-HARVEST_ABSTRACT_CHARS = 800  # 摘要截断长度（控制仓库体积：约 300 KB/天）
+HARVEST_MAX = 600             # 云端每天最多存几篇（控制仓库体积）
+HARVEST_ABSTRACT_CHARS = 600  # 摘要截断长度
+                              # 体积估算：600 篇 × 约 1.1 KB ≈ 660 KB/天
+                              #           × 14 天 ≈ 9 MB（工作流会自动删 14 天前的）
 HARVEST_CONSUMED = os.path.join(BASE_DIR, ".harvest_consumed.json")
 
 # 仓库 raw 地址（仓库是公开的，无需 token）
@@ -509,6 +545,12 @@ class OpenAlexFetcher:
 # 5. 模块三：两阶段过滤（V3.0 核心）
 # ══════════════════════════════════════════════
 
+def _no_abstract(paper):
+    """OpenAlex 对闭源论文不给摘要时，summary 会被填成 "No abstract available"。"""
+    s = (paper.get("summary") or "").strip()
+    return (not s) or s.startswith("No abstract")
+
+
 def local_regex_coarse_filter(papers, min_hits=None):
     """
     第一层：本地 Regex 粗筛
@@ -529,11 +571,25 @@ def local_regex_coarse_filter(papers, min_hits=None):
     # 按长度降序排列以确保长词优先匹配
     all_keywords_sorted = sorted(all_keywords, key=len, reverse=True)
 
-    passed = []
+    passed, n_bypass = [], 0
     for idx, paper in enumerate(papers, 1):
         title = paper.get("title", "")
         summary = paper.get("summary", "")
         text = (title + " " + summary).lower()
+
+        # ★ 2026-10-01：无摘要的（多是闭源）【不卡关键词】，全放行给本地模型判。
+        #   原因：闭源论文只有标题可比，而关键词表是多词精确短语
+        #   （如 "slope stability"），标题里换个说法（"rooted slope instability"）
+        #   就命中不了 —— 实测 654 篇无摘要里有 440 篇（67%）因此被误杀，
+        #   其中包括 Engineering Geology / Journal of Hydrology 的正经论文。
+        #   反过来，放宽成"slope/flow/soil"这类宽泛词更糟：会把
+        #   "Tafel slope"（电化学）、"soil respiration"（生态）也捞进来。
+        #   本地打分免费，让模型看标题判断，比任何词表都准。
+        if _no_abstract(paper) and COARSE_NO_ABSTRACT_BYPASS:
+            paper["regex_hits"] = ["<无摘要·全收>"]
+            passed.append(paper)
+            n_bypass += 1
+            continue
 
         # 统计命中关键词数
         hit_count = 0
@@ -549,9 +605,10 @@ def local_regex_coarse_filter(papers, min_hits=None):
             paper["regex_hits"] = hit_words[:5]  # 记录前 5 个命中词
             passed.append(paper)
 
-    print(f"  [输入] {len(papers)} 篇 → 粗筛后 {len(passed)} 篇")
-    print(f"  [规则] 标题/摘要命中 ≥{min_hits} 个核心关键词"
-          f"（SCORER={SCORER}）")
+    print(f"  [输入] {len(papers)} 篇 → 粗筛后 {len(passed)} 篇"
+          f"（其中 {n_bypass} 篇是无摘要直接放行）")
+    print(f"  [规则] 有摘要者命中 ≥{min_hits} 个核心关键词；"
+          f"无摘要者全收（交本地模型判）")
     print(f"  [中文关键词数] {len(KEYWORD_LIST_CN)} 个   [英文关键词数] {len(KEYWORD_LIST_EN)} 个")
 
     # 打印几个样本
@@ -998,6 +1055,16 @@ def download_all_oa_pdfs(papers):
             except Exception:
                 pass
 
+    # ★ 2026-10-01：把已归档的登记为 filed（状态比 seen 更进一步）
+    try:
+        import processed as _proc
+        for p, _fp in downloaded:
+            if _proc.key_of(p) in filed_keys:
+                _proc.mark(p, "filed")
+        _proc._save()
+    except Exception as e:
+        print(f"  [警告] 归档登记失败：{e}")
+
     print(f"  [汇总] 已归档 {len(filed)} 篇到 {lm.LIBRARY_DIR if lm else PDF_INBOX_DIR}")
     return filed, filed_keys
 
@@ -1123,7 +1190,7 @@ def send_email(html_content, attachments=None):
 # ══════════════════════════════════════════════
 
 def fetch_all_candidates():
-    """抓 RSS + OpenAlex 并全局去重。"""
+    """抓 RSS + OpenAlex + Crossref，跨源去重后返回。"""
     all_papers = []
     rss = fetch_papers_from_rss()
     if rss:
@@ -1134,13 +1201,33 @@ def fetch_all_candidates():
             all_papers.extend(oa)
     except Exception as e:
         print(f"  [Warning] OpenAlex 抓取失败：{e}")
-    seen, deduped = set(), []
-    for p in all_papers:
-        t = (p.get("title") or "").strip().lower()
-        if t and t not in seen:
-            seen.add(t)
-            deduped.append(p)
-    return deduped
+
+    # ★ 2026-10-01：Crossref 也要进候选池（实测 91% 是 OpenAlex 没有的）。
+    #   云端 harvest 同样用得上 —— 笔记本睡着的那些天，覆盖不能缩水。
+    if USE_CROSSREF:
+        try:
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            import sources as _src
+            all_papers.extend(_src.fetch_crossref(
+                CROSSREF_QUERIES, days=OPENALEX_DAYS_LOOKBACK, rows=CROSSREF_ROWS))
+            all_papers.extend(_src.fetch_crossref_journals(
+                days=OPENALEX_DAYS_LOOKBACK))
+        except Exception as e:
+            print(f"  [Warning] Crossref 抓取失败：{e}")
+
+    try:
+        import sources as _src
+        return _src.dedupe_by_title(all_papers)
+    except Exception:
+        seen, deduped = set(), []          # 退回到只按标题去重
+        for p in all_papers:
+            t = (p.get("title") or "").strip().lower()
+            if t and t not in seen:
+                seen.add(t)
+                deduped.append(p)
+        return deduped
 
 
 HARVEST_FIELDS = ("title", "link", "source", "data_source", "doi", "authors",
@@ -1163,7 +1250,7 @@ def run_harvest():
         return 0
     kept = local_regex_coarse_filter(cand, min_hits=COARSE_MIN_HITS)
     slim = []
-    for p in kept[:MAX_CANDIDATES]:
+    for p in kept[:HARVEST_MAX]:
         rec = {k: p.get(k) for k in HARVEST_FIELDS}
         rec["summary"] = (p.get("summary") or "")[:HARVEST_ABSTRACT_CHARS]
         slim.append(rec)
@@ -1265,6 +1352,32 @@ def main():
     if oa_papers:
         all_papers.extend(oa_papers)
 
+    # A3: ★ Crossref 抓取（2026-10-01 新增）—— 实测 91% 是 OpenAlex 没有的
+    if USE_CROSSREF:
+        try:
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            import sources as _src
+            print("\n" + "=" * 60)
+            print("【Crossref 源】主题检索 + 期刊目录（替代已死的 RSS）")
+            print("=" * 60)
+            cr = _src.fetch_crossref(CROSSREF_QUERIES,
+                                     days=OPENALEX_DAYS_LOOKBACK,
+                                     rows=CROSSREF_ROWS)
+            cr += _src.fetch_crossref_journals(days=OPENALEX_DAYS_LOOKBACK)
+            all_papers.extend(cr)
+            print(f"  [Crossref] 合计 {len(cr)} 篇")
+        except Exception as e:
+            print(f"  [警告] Crossref 抓取失败：{type(e).__name__}: {e}")
+    if USE_ARXIV:
+        try:
+            import sources as _src
+            all_papers.extend(_src.fetch_arxiv(
+                ['all:"preferential flow"', 'all:"slope stability"'], 60))
+        except Exception as e:
+            print(f"  [警告] arXiv 抓取失败：{e}")
+
     # ★ 2026-10-01：把云端（GitHub Actions）在笔记本睡着时攒下的候选合并进来。
     #   放在"无数据就退出"之前——万一本地网络抽风抓不到，云端攒的还是能兜住。
     all_papers = merge_harvest(all_papers)
@@ -1303,11 +1416,47 @@ def main():
         print("\n[结果] 粗筛后无文献通过，任务结束")
         return
 
-    # B2: 限流
+    # B2: ★ 全局去重（2026-10-01 新增）
+    # 为什么必须在打分之前：OpenAlex 回看 7 天 ⇒ 同一篇会连续 7 天进候选池。
+    # 以前每天重下重命名 ⇒ Library 里 xxx.pdf / xxx (1).pdf / xxx (2).pdf 一路堆。
+    # 放在这里还能顺手省掉重复打分的时间。
+    try:
+        import sys as _sys
+        if BASE_DIR not in _sys.path:
+            _sys.path.insert(0, BASE_DIR)
+        import processed
+        coarse_papers = processed.filter_new(coarse_papers)
+    except Exception as e:
+        print(f"  [警告] 去重表不可用，本轮按不去重处理：{e}")
+
+    # B3: 限流
     # ★ 2026-10-01：本地打分免费 ⇒ 上限从 40 放开到 MAX_CANDIDATES=500
     #   （DeepSeek 路径仍按 MAX_DEEPSEEK_INPUT=40 卡住，防止 API 费用暴涨）
     _cap = MAX_CANDIDATES if SCORER == "local" else MAX_DEEPSEEK_INPUT
     deepseek_input = limit_for_deepseek(coarse_papers, _cap)
+
+    # B4: ★ 摘要补全（2026-10-01 新增）
+    # 只对【将要打分的那些】做，避免为低产出耗时间。
+    # 顺序：先 Crossref（便宜、快），再网页（慢、且只在 Copernicus 类平台有效）。
+    if ABSTRACT_ENRICH_CROSSREF or ABSTRACT_ENRICH_WEB:
+        try:
+            import sources as _src
+            n0 = sum(1 for p in deepseek_input
+                     if (p.get("summary") or "").startswith("No abstract"))
+            print(f"\n  [摘要补全] 待打分 {len(deepseek_input)} 篇，"
+                  f"其中无摘要 {n0} 篇")
+            if n0:
+                if ABSTRACT_ENRICH_CROSSREF:
+                    _src.enrich_abstracts(deepseek_input,
+                                          max_lookups=ABSTRACT_ENRICH_CROSSREF)
+                if ABSTRACT_ENRICH_WEB:
+                    _src.enrich_abstracts_web(deepseek_input,
+                                              max_lookups=ABSTRACT_ENRICH_WEB)
+                n1 = sum(1 for p in deepseek_input
+                         if (p.get("summary") or "").startswith("No abstract"))
+                print(f"  [摘要补全] 无摘要 {n0} → {n1} 篇")
+        except Exception as e:
+            print(f"  [警告] 摘要补全失败：{type(e).__name__}: {e}")
 
     # ==========================
     # 阶段 C: DeepSeek 打分 + 双轨制
@@ -1321,6 +1470,13 @@ def main():
 
     # C2: 双轨制筛选
     pass_list, browsing_list = dual_track_filter(scored_papers)
+
+    # ★ 2026-10-01：把打过分的一律登记（不管分高分低），下次不再重复打分
+    try:
+        import processed as _proc
+        _proc.mark_many(scored_papers, "seen")
+    except Exception as e:
+        print(f"  [警告] 去重表登记失败：{e}")
 
     # ==========================
     # 阶段 D: .ris 生成
@@ -1381,6 +1537,15 @@ def main():
         dl_csv, dl_n = _lm2.build_download_list(pass_list + browsing_list,
                                                 filed_keys)
         if dl_csv:
+            # ★ 登记为 listed，避免同一篇明天又被列一次
+            try:
+                import processed as _proc
+                for _p in (pass_list + browsing_list):
+                    if _proc.key_of(_p) not in filed_keys:
+                        _proc.mark(_p, "listed")
+                _proc._save()
+            except Exception:
+                pass
             print(f"\n📥 待下载清单（{dl_n} 篇）：{dl_csv}")
             print(f"   手动下载后丢进 {_lm2.MANUAL_DROP_DIR}，"
                   f"再跑 python manual_ingest.py")
