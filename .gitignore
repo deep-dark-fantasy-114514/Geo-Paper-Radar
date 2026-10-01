@@ -8,6 +8,7 @@ __pycache__/
 EndNote_Watch/
 Library/
 PDF_Inbox/
+PDF_Temp/     # ★ OA PDF 的暂存区（下载→重命名→归档 之间）。不归档时不用
 .harvest_consumed.json
 processed.json
 *.bak*        # 含 .bak_ / .bak2_ / .bak3_ 等所有变体

@@ -107,14 +107,21 @@ def status_of(paper):
 
 
 def mark(paper, status="seen", score=None):
-    """记下这篇。已存在则【升级状态】（seen → listed → filed），不回退。"""
+    """记下这篇。已存在则【升级状态】（failed < seen < listed < filed），不回退。
+
+    ★ 2026-10-01：新增 "failed" —— 归档失败、等下次重试。
+      见 filter_new 的说明。
+    """
     k = key_of(paper)
     if not k or k == "title:":
         return
     d = load()
     today = time.strftime("%Y-%m-%d")
     old = d.get(k)
-    rank = {"seen": 0, "listed": 1, "filed": 2}
+    # ⚠️ failed 必须排在 seen 之后：mark() 是"只升不降"的，如果 failed 排在
+    #    seen 前面，"打分后被标 seen" 就会把它顶掉 ⇒ 永远记不上 failed ⇒
+    #    次日不重试（这正是要修的那个 bug）。而重试成功写 filed(4) 仍能覆盖它。
+    rank = {"seen": 1, "failed": 2, "listed": 3, "filed": 4}
     if old and isinstance(old, list) and len(old) > 1:
         if rank.get(old[1], 0) > rank.get(status, 0):
             status = old[1]              # 保留更"靠后"的状态
@@ -133,17 +140,31 @@ def mark_many(papers, status="seen"):
 
 
 def filter_new(papers):
-    """返回【没处理过】的那些。放在打分之前调用，省下重复打分的时间。"""
+    """返回【没处理过】的那些。放在打分之前调用，省下重复打分的时间。
+
+    ★ 2026-10-01：状态为 "failed"（归档失败）的【放行】。
+      原来只要键在表里就一律拦掉 —— 于是"下载下来了但归档时被
+      EndNote 锁住"的那篇次日永远不会重试，中文重命名与 Library 归
+      档对它永久失效。现在给 failed 第二次机会。
+    """
     d = load()
-    out, skipped = [], 0
+    out, skipped, retry = [], 0, 0
     for p in papers:
         k = key_of(p)
-        if k and k != "title:" and k in d:
+        rec = d.get(k) if (k and k != "title:") else None
+        st = None
+        if rec is not None:
+            st = rec[1] if isinstance(rec, list) and len(rec) > 1 else "seen"
+        if rec is not None and st != "failed":
             skipped += 1
             continue
+        if st == "failed":
+            retry += 1
         out.append(p)
     if skipped:
         print("  [去重] 已处理过 %d 篇，跳过；本轮新文献 %d 篇" % (skipped, len(out)))
+    if retry:
+        print("  [重试] 其中 %d 篇上次归档失败，本轮重试" % retry)
     return out
 
 

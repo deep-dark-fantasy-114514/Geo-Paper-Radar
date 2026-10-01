@@ -9,6 +9,7 @@ import json
 import time
 
 from config import *
+from research_profile import QUALITATIVE_FIELDS
 import local_scorer          # 打分提示词/归一化都在这里，两边共用
 
 
@@ -30,6 +31,13 @@ def build_deepseek_prompt(title, abstract):
         '{"slope_stability": <0-10整数>, "rainfall_infiltration": <0-10整数>, '
         '"preferential_flow": <0-10整数>, "method_innovation": <0-10整数>, '
         '"total_score": <0-40整数>, '
+        # ★ 2026-10-01：补上三个【定性】字段。原来只在本地打分器的 prompt 里
+        #   有 —— 一旦把 SCORER 切到 deepseek，简报的「作用/尺度/方法」三列
+        #   会全部退化成 "—"（下游 library_manager.build_digest 读的就是这三个键），
+        #   而且没有任何提示。这里与 local_scorer 用同一份 QUALITATIVE_FIELDS。
+        '"dual_role":"<adverse|beneficial|both|none>",'
+        '"scale":"<pore|slope|catchment|regional|na>",'
+        '"approach":"<numerical|experimental|theoretical|review|data-driven|na>",'
         '"reason": "<20字以内的中文推荐理由>", '
         '"tldr": "<一句话中文总结该文创新点>"}'
     )
@@ -101,6 +109,12 @@ def score_paper_with_deepseek(title, abstract, retries=2):
         result["recommendation"] = "strong" if ts >= TOTAL_SCORE_PASS else ("normal" if ts >= BROWSING_THRESHOLD else "weak")
         result["score"] = round(result["total_score"] / 40 * 100)
         result["tldr"] = result.get("tldr", "")
+        # ★ 2026-10-01：定性字段归一化 —— 与 local_scorer.normalize 完全同规则。
+        #   取值不在允许集合里就退回 none/na，避免模型自由发挥污染下游筛选。
+        for _f, _spec in QUALITATIVE_FIELDS.items():
+            _v = str(result.get(_f, "")).strip().lower()
+            result[_f] = _v if _v in _spec["values"] else (
+                "none" if _f == "dual_role" else "na")
         return result
     except json.JSONDecodeError as e:
         print(f"  [Error] JSON 解析失败: {e}")

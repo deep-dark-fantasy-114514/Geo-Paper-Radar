@@ -167,6 +167,17 @@ ENDNOTE_WATCH_DIR = os.path.join(BASE_DIR, "EndNote_Watch")
 # 首次配置（只做一次）：EndNote → Edit → Preferences → PDF Handling
 #   ☑ Enable automatic importing，PDF Auto Import Folder = 下面这个目录
 PDF_INBOX_DIR = os.path.join(BASE_DIR, "PDF_Inbox")
+
+# ★ 2026-10-01 新增：PDF 暂存区。
+# 为什么必须要有：PDF_Inbox 是 EndNote **实时监听**的自动导入目录，
+# 而下载是【批处理】的（PDF_MAX_PER_RUN=20 一起下），重命名却要一篇篇
+# 走视觉模型（render_pages + 一次多模态调用，5–15 s/篇）。
+# 原来直接下进 PDF_Inbox ⇒ 第一个文件要在 EndNote 眼皮底下躺 2–5 分钟。
+# 被 EndNote 抢先读走就加上排他锁，shutil.move 抛 PermissionError ⇒
+# **该篇的中文重命名与 Library 归档全部丢失**，且次日不会再试。
+# ⇒ 改为：下到 PDF_Temp → 重命名 → 归档 Library → 最后才单向复制进 PDF_Inbox。
+PDF_STAGE_DIR = os.path.join(BASE_DIR, "PDF_Temp")
+PDF_STAGE_KEEP_DAYS = 7          # 暂存区里超过这个天数的残留自动清掉
 PDF_MAX_PER_RUN = 20             # 单次最多下几篇，防止失控
 PDF_MAX_MB = 60                  # 单个 PDF 体积上限（MB）
 PDF_MIN_BYTES = 20 * 1024        # 小于 20 KB 的多半是错误页，丢弃
@@ -188,6 +199,22 @@ PDF_MIN_BYTES = 20 * 1024        # 小于 20 KB 的多半是错误页，丢弃
 LOCAL_MODE = (os.getenv("PAPER_RADAR_ENV", "").strip().lower()
               or ("local" if os.name == "nt" else "cloud")) == "local"
 PDF_DOWNLOAD_ENABLED = LOCAL_MODE   # 云端下载了也没处放，直接关掉
+
+# ---- ★ 2026-10-01：三个原先硬编码在 library_manager.py 里的外部路径 ----
+#    原来写死了 E:\ 盘符和 C:\Users\zihao\ —— 换机器 / 换盘 / 上 Linux 就得改代码。
+#    现在一律走配置，且**环境变量优先**：
+#        PAPER_RADAR_MANUAL_DROP / PAPER_RADAR_RENAMER / PAPER_RADAR_ASK_IMAGE
+MANUAL_DROP_DIR = os.getenv("PAPER_RADAR_MANUAL_DROP",
+                            os.path.join(os.path.dirname(BASE_DIR), "手动下载"))
+# PDF 重命名脚本（复用现成的独立工具，指向它的 .py 文件）
+RENAMER = os.getenv("PAPER_RADAR_RENAMER",
+                    os.path.join(os.path.dirname(BASE_DIR),
+                                 "PDF_Renamer_Skill", "rename_pdfs_ai.py"))
+# 本地视觉模型桥（看 PDF 标题页用）
+ASK_IMAGE = os.getenv(
+    "PAPER_RADAR_ASK_IMAGE",
+    os.path.join(os.path.expanduser("~"), ".claude", "skills",
+                 "local-vision", "scripts", "ask_image.py"))
 
 SCORER = os.getenv("PAPER_RADAR_SCORER",
                    "local" if LOCAL_MODE else "deepseek")   # local | deepseek
