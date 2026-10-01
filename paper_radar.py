@@ -56,15 +56,25 @@ def main():
     # ==========================
 
     # A1: RSS 抓取
-    rss_papers = fetch_papers_from_rss()
-    if rss_papers:
-        all_papers.extend(rss_papers)
+    # ★ 2026-10-01 修：原来裸奔调用。RSS 源常遇 DNS 失败 / SSL 过期 / 503，
+    #   一抛异常就【崩在启动阶段】，连后面的 merge_harvest（把云端攒的候选捞回来）
+    #   都执行不到 —— 而那正是笔记本睡过觉之后的唯一补救途径。
+    #   所以每个源都要兜住，坏一个不影响其余。
+    try:
+        rss_papers = fetch_papers_from_rss()
+        if rss_papers:
+            all_papers.extend(rss_papers)
+    except Exception as e:
+        print(f"  [警告] RSS 抓取失败（继续跑其余源）：{type(e).__name__}: {e}")
 
     # A2: OpenAlex 抓取
-    oa_fetcher = OpenAlexFetcher(mailto=SMTP_SENDER)
-    oa_papers = oa_fetcher.fetch_papers()
-    if oa_papers:
-        all_papers.extend(oa_papers)
+    try:
+        oa_fetcher = OpenAlexFetcher(mailto=SMTP_SENDER)
+        oa_papers = oa_fetcher.fetch_papers()
+        if oa_papers:
+            all_papers.extend(oa_papers)
+    except Exception as e:
+        print(f"  [警告] OpenAlex 抓取失败（继续跑其余源）：{type(e).__name__}: {e}")
 
     # A3: ★ Crossref 抓取（2026-10-01 新增）—— 实测 91% 是 OpenAlex 没有的
     if USE_CROSSREF:
@@ -129,19 +139,26 @@ def main():
         return
 
     # 全局去重
-    seen = set()
-    deduped_global = []
-    for p in all_papers:
-        t = p.get("title", "").strip().lower()
-        if t and t not in seen:
-            seen.add(t)
-            deduped_global.append(p)
+    # ★ 2026-10-01 修：原来只做 title.strip().lower()，跨源的细微差异
+    #   （尾部句点 / HTML 实体 &amp; / <i> 标签 / 连续空白）全都识别不出。
+    #   改用 sources.dedupe_by_title()：**优先按规范化 DOI，其次按清洗后的标题**。
+    #   （这个函数早就写好了、也 import 了，却一直没被调用 —— 顺手修正。）
+    before = len(all_papers)
+    all_papers = dedupe_by_title(all_papers)
+    deduped_global = all_papers
+    if before != len(deduped_global):
+        print(f"  [跨源去重] {before} → {len(deduped_global)} 篇")
 
     total = len(deduped_global)
-    rss_count = sum(1 for p in deduped_global if p.get("data_source") == "RSS")
-    oa_count = sum(1 for p in deduped_global if p.get("data_source") == "OpenAlex")
+    # ★ 2026-10-01 修：原来硬编码只统计 RSS / OpenAlex，
+    #   Crossref / OpenAlex-Diss / OpenAlex-CN 在日志里【完全隐身】，
+    #   显示"总共 150 篇 = RSS 10 + OpenAlex 20"这种对不上的数。
+    from collections import Counter
+    _by_src = Counter(p.get("data_source", "?") for p in deduped_global)
     print(f"\n{'=' * 60}")
-    print(f"📊 全局合并: RSS {rss_count} 篇 + OpenAlex {oa_count} 篇 = {total} 篇")
+    print(f"📊 全局合并共 {total} 篇，按来源：")
+    for _s, _n in _by_src.most_common():
+        print(f"     {_s:16s} {_n:5d} 篇")
     print(f"{'=' * 60}")
 
     if not deduped_global:
@@ -225,10 +242,16 @@ def main():
     # 阶段 C: DeepSeek 打分 + 双轨制
     # ==========================
 
-    # C1: DeepSeek 细筛
+    # C1: 细筛（默认走本地 Qwen，失败才回退 DeepSeek）
     scored_papers = score_all_papers(deepseek_input, phase_label="细筛")
     if not scored_papers:
-        print("\n[结果] DeepSeek 打分全部失败，任务结束")
+        # ★ 2026-10-01 修：原来写死 "DeepSeek 打分全部失败"，
+        #   但默认配置是本地 Qwen —— 日志会把排查方向指错。
+        _scorer_name = ("本地 Qwen3.5-9B" if SCORER == "local" else "DeepSeek")
+        print(f"\n[结果] {_scorer_name} 打分全部失败，任务结束")
+        if SCORER == "local":
+            print("   ↳ 本地模型起不来？检查显卡占用（MinerU 会抢显存）、"
+                  "或临时用 PAPER_RADAR_SCORER=deepseek 跑一轮")
         return
 
     # C1.5: ★ 把「只有标题·未打分」的挑出来（用户 2026-10-01 定）
@@ -371,8 +394,13 @@ def main():
     elapsed = time.time() - start_time
     print(f"\n{'=' * 60}")
     print(f"🏁 V3.0 任务完成！总耗时: {elapsed:.1f} 秒")
-    print(f"📊 RSS {rss_count} + OpenAlex {oa_count} → 粗筛 {len(coarse_papers)} "
-          f"→ DeepSeek {len(scored_papers)} → 通关 {len(pass_list)} → 备选 {len(browsing_list)}")
+    print(f"📊 抓取 {total} 篇（{len(_by_src)} 个源）"
+          f" → 粗筛 {len(coarse_papers)}"
+          f" → 打分 {len(scored_only)}"
+          f" → 通关 {len(pass_list)} + 备选 {len(browsing_list)}"
+          + (f" + 只标题 {len(titleonly_list)}" if titleonly_list else ""))
+    print(f"   （打分器：{'本地 Qwen3.5-9B' if SCORER == 'local' else 'DeepSeek'}；"
+          f"{'免 token 成本' if SCORER == 'local' else '按量计费'}）")
     print(f"📬 邮箱: {SMTP_RECEIVER}  |  📁 .ris: {ENDNOTE_WATCH_DIR}")
     print(f"📥 OA PDF: {PDF_INBOX_DIR}（已存 {len(pdf_saved)} 篇）")
     if pdf_saved:

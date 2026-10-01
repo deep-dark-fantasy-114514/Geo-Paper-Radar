@@ -69,7 +69,16 @@ def fetch_all_candidates():
 
     try:
         import sources as _src
-        return _src.dedupe_by_title(all_papers)
+        before = len(all_papers)
+        out = _src.dedupe_by_title(all_papers)
+        # ★ 2026-10-01：按来源统计，云端日志里也看得见各源贡献
+        #   （原来 main() 只统计 RSS/OpenAlex，其余源在日志里隐身）
+        from collections import Counter
+        _c = Counter(x.get("data_source", "?") for x in out)
+        print(f"  [跨源去重] {before} → {len(out)} 篇，按来源：")
+        for _s2, _n2 in _c.most_common():
+            print(f"     {_s2:16s} {_n2:5d} 篇")
+        return out
     except Exception:
         seen, deduped = set(), []          # 退回到只按标题去重
         for p in all_papers:

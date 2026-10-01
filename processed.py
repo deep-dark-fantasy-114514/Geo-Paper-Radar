@@ -60,7 +60,7 @@ def key_of(paper):
     t = (paper.get("title") or "").strip().lower()
     t = re.sub(r"<[^>]+>", " ", t)                    # 去掉 XML 标签
     t = re.sub(r"[^0-9a-z一-鿿 ]", "", re.sub(r"\s+", " ", t))
-    return "title:" + t[:120]
+    return "title:" + t.strip()[:120]   # ★ strip：标签替换会留下前导空格
 
 
 # --------------------------------------------------------------- 读写

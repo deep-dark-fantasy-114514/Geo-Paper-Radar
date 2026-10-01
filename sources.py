@@ -583,12 +583,33 @@ def enrich_abstracts_web(papers, max_lookups=40, min_gap=1.5):
 # ══════════════════════════════════════════════
 # 7. 跨源去重
 # ══════════════════════════════════════════════
+def _norm_title_key(title):
+    """规范化标题，用于跨源去重。
+
+    ⚠️ 规则必须与 `processed.key_of()` / `library_manager.key_of()` **保持一致**，
+       否则同一篇会算出不同的键，去重失效。
+
+    处理顺序很关键：**先剥 HTML 标签，再删标点**。
+    反过来会把标签里的字母留下 —— 实测 `<i>Preferential flow</i> in slopes`
+    会被规范化成 `ipreferential flowi in slopes`，从而漏判重复。
+    """
+    t = (title or "").strip().lower()
+    t = re.sub(r"<[^>]+>", " ", t)          # 先剥标签（否则字母残留）
+    t = re.sub(r"\s+", " ", t)              # 压空白
+    t = re.sub(r"[^0-9a-z一-鿿 ]", "", t)   # 去标点
+    return t.strip()
+
+
 def dedupe_by_title(papers):
-    """按 规范化标题 / DOI 去重。保留先出现的（顺序即优先级）。"""
+    """按【规范化 DOI（优先）】或【规范化标题（兜底）】去重。
+
+    保留先出现的（顺序即优先级）。跨源（RSS / OpenAlex / Crossref）的标题
+    常带细微差异：尾部句点、HTML 实体、<i> 标签、连续空白 —— 统一在
+    `_norm_title_key` 里处理。
+    """
     seen_t, seen_d, out = set(), set(), []
     for p in papers:
-        t = re.sub(r"[^0-9a-z一-鿿 ]", "",
-                   re.sub(r"\s+", " ", (p.get("title") or "").lower())).strip()
+        t = _norm_title_key(p.get("title"))
         d = norm_doi(p.get("doi"))
         if (t and t in seen_t) or (d and d in seen_d):
             continue
