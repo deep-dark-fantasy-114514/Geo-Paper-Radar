@@ -20,6 +20,7 @@ import hashlib
 import smtplib
 import traceback
 import re
+import shutil
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -436,6 +437,50 @@ def safe_filename(text, max_len=40):
     if safe.upper() in _WIN_RESERVED:         # 撞保留名 ⇒ 加前缀
         safe = "_" + safe
     return safe
+
+
+def unique_path(path):
+    """重名不覆盖：`x.pdf` 已存在就退到 `x (1).pdf`。"""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    i = 1
+    while True:
+        cand = f"{stem} ({i}){ext}"
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+
+def atomic_copy_into(src, dst_dir, name=None):
+    """把 src 复制进 dst_dir，**先写 .tmp 再 os.replace**，返回最终路径。
+
+    ★ 2026-10-01：抽出来的唯一理由 —— `PDF_Inbox` 是 **EndNote 实时监听**的
+      自动导入目录，往里裸写 `shutil.copy2` 有真实风险：地学论文 PDF 常带
+      高分辨率遥感/航拍图，几十 MB 要写几百毫秒到数秒；EndNote 若在写完之前
+      介入，轻则读取报错，重则**把半截 PDF 导进文献库**。
+      本仓库的 download.py 早就是 `.downloading` + `os.replace` 的写法，
+      但另外三处（library_manager / manual_ingest / download 的回填）一直是裸拷。
+
+      用法统一走这一个函数，别再各处手写。
+    """
+    os.makedirs(dst_dir, exist_ok=True)
+    target = unique_path(os.path.join(dst_dir, name or os.path.basename(src)))
+    tmp = target + ".tmp"
+    try:
+        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+            shutil.copyfileobj(fi, fo, 1024 * 256)
+            fo.flush()
+            os.fsync(fo.fileno())
+        os.replace(tmp, target)          # 原子换名：EndNote 只会看到完整文件
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+    return target
 
 
 def infer_journal_name(url):

@@ -82,19 +82,6 @@ def _find_pdf_url(html_bytes, base_url):
     return None
 
 
-def _unique_path(path):
-    """重名不覆盖（归档失败要回填 PDF_Inbox 时用）。"""
-    if not os.path.exists(path):
-        return path
-    stem, ext = os.path.splitext(path)
-    i = 1
-    while True:
-        cand = f"{stem} ({i}){ext}"
-        if not os.path.exists(cand):
-            return cand
-        i += 1
-
-
 def _sweep_stage():
     """清掉暂存区里超过 PDF_STAGE_KEEP_DAYS 天的残留（归档反复失败的那些）。"""
     try:
@@ -348,9 +335,8 @@ def download_all_oa_pdfs(papers):
                 pass
             try:
                 if os.path.exists(fp):
-                    os.makedirs(PDF_INBOX_DIR, exist_ok=True)
-                    shutil.copy2(fp, _unique_path(
-                        os.path.join(PDF_INBOX_DIR, os.path.basename(fp))))
+                    # 走原子拷贝：PDF_Inbox 是 EndNote 实时监听的目录
+                    atomic_copy_into(fp, PDF_INBOX_DIR)
                     _ok_to_inbox += 1
             except Exception as e:
                 print(f"  [警告] 回填 PDF_Inbox 失败：{str(e)[:50]}")

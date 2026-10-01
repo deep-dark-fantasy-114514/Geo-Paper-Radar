@@ -33,7 +33,8 @@ except Exception:
 #                     里的实现重复。实测两边输出完全一致，但那是巧合；
 #                     以后改清洗规则漏掉一处就会"去重表说处理过、下载清单说没有"。
 #                     现在直接引用，只有一个真身。
-from config import BASE_DIR, PDF_INBOX_DIR, MANUAL_DROP_DIR, RENAMER, ASK_IMAGE
+from config import (BASE_DIR, PDF_INBOX_DIR, MANUAL_DROP_DIR, RENAMER, ASK_IMAGE,
+                    atomic_copy_into, unique_path)
 from processed import key_of                      # noqa: F401 (对外仍以 lm.key_of 暴露)
 from filters import _no_abstract as has_no_abstract   # noqa: F401
 
@@ -85,16 +86,9 @@ def pick_category(paper):
 
 
 def _unique(path):
-    """重名不覆盖。"""
-    if not os.path.exists(path):
-        return path
-    stem, ext = os.path.splitext(path)
-    i = 1
-    while True:
-        cand = f"{stem} ({i}){ext}"
-        if not os.path.exists(cand):
-            return cand
-        i += 1
+    """重名不覆盖。★ 2026-10-01：实现搬到 config.unique_path（download /
+    manual_ingest 都要用，避免又出现三份各自进化的副本），这里只留个别名。"""
+    return unique_path(path)
 
 
 def rename_pdf(pdf, ai, rn, template=DEFAULT_TEMPLATE, pages=3, dpi=150):
@@ -141,9 +135,11 @@ def file_paper(pdf, paper, ai=None, rn=None, template=DEFAULT_TEMPLATE,
         return None, "归档失败"
 
     # 同时放一份到 EndNote 的自动导入文件夹（必须平铺）
+    # ★ 2026-10-01：原来裸 shutil.copy2 —— PDF_Inbox 是 EndNote 实时监听的目录，
+    #   几十 MB 的 PDF 写几百毫秒到数秒，监视器可能读到半截文件并把它导进库里。
+    #   改用 config.atomic_copy_into（.tmp + os.replace）。
     try:
-        os.makedirs(PDF_INBOX_DIR, exist_ok=True)
-        shutil.copy2(dst, _unique(os.path.join(PDF_INBOX_DIR, newname)))
+        atomic_copy_into(dst, PDF_INBOX_DIR, newname)
     except Exception as e:
         print(f"     ⚠ 复制到 PDF_Inbox 失败：{str(e)[:50]}")
 

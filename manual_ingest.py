@@ -28,6 +28,7 @@ manual_ingest.py —— 把【你手动下载的 PDF】自动重命名、归类�
 建议：一周或一月跑一次；也可以把它也挂进 Windows 计划任务。
 """
 import argparse
+import difflib
 import glob
 import io
 import json
@@ -45,12 +46,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import library_manager as lm          # noqa: E402
+import processed                      # noqa: E402   ★ 入库后要回报中央去重表
 
 DEFAULT_TEMPLATE = "{year}_{author}_{title_zh}"
 INGESTED_MARK = os.path.join(lm.DOWNLOAD_LIST_DIR, "_已入库.json")
 
 CLASSIFY_PROMPT = (
-    "这是一篇地学论文的标题页。请只输出一个 JSON，不要解释：\n"
+    "这是一篇地学论文的前几页。请只输出一个 JSON，不要解释：\n"
     '{"category": "<四选一>"}\n'
     "四选一：优先流 / 降雨入渗 / 边坡稳定 / 方法创新\n"
     "判断依据：\n"
@@ -61,8 +63,47 @@ CLASSIFY_PROMPT = (
     "都不沾就填 其他。"
 )
 
+# ★ 2026-10-01：模型输出常是"语义正确但字面微调"
+#   （边坡稳定性 / 滑坡稳定性 / 边坡失稳…）。原来严格全等 ⇒ 一律打回"其他"，
+#   分类退化。改成关键词命中。
+CATEGORY_SYNONYMS = [
+    ("优先流",     ("优先流", "优势流", "大孔隙", "裂隙流", "根土间隙", "preferential", "macropore")),
+    ("降雨入渗",   ("降雨入渗", "入渗", "非饱和渗流", "湿润锋", "入渗模型", "infiltration")),
+    ("边坡稳定",   ("边坡", "滑坡", "斜坡", "稳定", "加固", "slope", "landslide")),
+    ("方法创新",   ("方法创新", "创新", "新模型", "新方法", "新实验")),
+]
+
+
+def normalize_category(raw):
+    """把模型的自由发挥收敛到四个主题之一，收不住就"其他"。"""
+    s = (raw or "").strip()
+    if not s:
+        return "其他"
+    for cat, kws in CATEGORY_SYNONYMS:
+        if any(kw in s.lower() or kw in s for kw in kws):
+            return cat
+    return "其他"
+
 
 # --------------------------------------------------------------- 清单索引
+def _norm_doi(s):
+    """DOI 归一化：去协议头 + 转小写。
+
+    ★ 2026-10-01：建索引和查索引必须用同一个函数。
+      原来建索引只 `.strip().lower()`（不剥协议头），查询时却剥了
+      ⇒ CSV 里若残留 `http://dx.doi.org/10.x`（旧版 library_manager
+      只 replace 掉了 https://doi.org/ 一种），精确匹配直接落空。
+    """
+    d = re.sub(r"^https?://(dx\.)?doi\.org/", "", (s or "").strip(), flags=re.I)
+    return d.strip().lower()
+
+
+def _norm_title(s):
+    """标题归一化：压空白 + 转小写 + 去标点。与 processed.key_of 同规则。"""
+    t = re.sub(r"\s+", " ", (s or "").strip().lower())
+    return re.sub(r"[^0-9a-z一-鿿 ]", "", t)
+
+
 def load_pending_index():
     """把所有待下载清单读成 {key: 条目} 的索引。"""
     idx = {}
@@ -71,9 +112,8 @@ def load_pending_index():
             import csv
             with io.open(p, encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
-                    doi = (row.get("doi") or "").strip().lower()
-                    title = re.sub(r"\s+", " ", (row.get("title") or "").strip().lower())
-                    title = re.sub(r"[^0-9a-z一-鿿 ]", "", title)
+                    doi = _norm_doi(row.get("doi"))
+                    title = _norm_title(row.get("title"))
                     if doi:
                         idx["doi:" + doi] = row
                     if title:
@@ -81,6 +121,21 @@ def load_pending_index():
         except Exception as e:
             print("  [警告] 读清单失败 %s：%s" % (os.path.basename(p), e))
     return idx
+
+
+def _similarity(a, b):
+    """两段标题的相似度（0–1）。
+
+    ★ 2026-10-01：选 `SequenceMatcher`（字符级）而不是词集 Jaccard ——
+      实测同一篇论文只差一个词（OCR 常见）时：
+              Jaccard 0.82   SeqMatcher 0.94
+      而【不同篇但开头同质】时：
+              Jaccard 0.80   SeqMatcher 0.89
+      Jaccard 的真假分离只有 0.02，压根切不开；SeqMatcher 有 0.05 的余量。
+      中文标题没有空格、词集法还要额外切词，字符级反而是通用解。
+    """
+    return difflib.SequenceMatcher(
+        None, _norm_title(a), _norm_title(b)).ratio()
 
 
 def _load_done():
@@ -100,21 +155,52 @@ def _save_done(s):
         pass
 
 
+# 模糊匹配阈值。实测（2026-10-01）：
+#     同一篇、英文、差 1–2 个词 .......... 0.944–0.945
+#     不同篇、英文、开头同质 ............ 0.769 / 0.835 / 0.894
+#     同一篇、中文短标题、差 2 个字 ...... 0.857
+#     不同篇、中文短标题、差 4 个字 ...... 0.828
+# ⚠️ 真假的取值区间【有重叠】（真最低 0.857 < 假最高 0.894），没有任何阈值能全对。
+#    取 0.92 = 可用的最大间隔：既不放进任何假匹配，也救回英文的 OCR 噪声。
+#    代价是【中文短标题被 OCR 打错两个字时匹配不上】——
+#    它只会退到"清单未命中，模型判定"另判一个主题，**不会张冠李戴**。
+#    这个方向的失败是可接受的：错配的代价（套错分类 + 销错账）远高于漏配。
+MATCH_MIN_SIM = 0.92
+
+
 def match_entry(meta, idx):
-    """用 DOI（主）或规范化标题（辅）在清单里找出该篇。返回 (条目, 命中方式)。"""
-    doi = (meta.get("doi") or "").strip().lower()
-    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
-    if doi and ("doi:" + doi) in idx:
-        return idx["doi:" + doi], "DOI"
-    t = re.sub(r"\s+", " ", (meta.get("title") or "").strip().lower())
-    t = re.sub(r"[^0-9a-z一-鿿 ]", "", t)
-    if t and ("title:" + t[:120]) in idx:
-        return idx["title:" + t[:120]], "标题"
-    # 退化匹配：标题前 40 字命中即可（PDF 标题与 OpenAlex 常有细微出入）
+    """用 DOI（主）或标题（辅）在清单里找出该篇。
+
+    返回 (条目, 命中的索引键, 命中方式)。第三个是**索引里那把标准键** ——
+    入库销账必须用它，不能用 OCR 出来的 meta 现算（见 main 里的说明）。
+    """
+    doi = _norm_doi(meta.get("doi"))
+    k = "doi:" + doi
+    if doi and k in idx:
+        return idx[k], k, "DOI"
+
+    t = _norm_title(meta.get("title"))
+    k = "title:" + t[:120]
+    if t and k in idx:
+        return idx[k], k, "标题"
+
+    # ★ 2026-10-01：退化匹配原来比【前 40 字全等】——
+    #   地学标题开头高度同质，实测 5 组真实标题里 2 组前 40 字完全相同
+    #   （"Numerical investigation of the effect of " 恰好 40 字符！），
+    #   而且 `for k in idx.items()` 是【按字典序任取其一】⇒ 张冠李戴，
+    #   套上错误的分类与记录。改为词集 Jaccard 相似度。
+    if len(t) <= 25:
+        return None, None, None
+    best, best_key, best_sim = None, None, 0.0
     for k, v in idx.items():
-        if k.startswith("title:") and len(t) > 25 and k[6:46] == t[:40]:
-            return v, "标题(模糊)"
-    return None, None
+        if not k.startswith("title:"):
+            continue
+        sim = _similarity(t, k[6:])
+        if sim > best_sim:
+            best, best_key, best_sim = v, k, sim
+    if best is not None and best_sim >= MATCH_MIN_SIM:
+        return best, best_key, "标题(相似 %.2f)" % best_sim
+    return None, None, None
 
 
 # --------------------------------------------------------------- 主流程
@@ -132,16 +218,36 @@ def main():
     done = _load_done()
 
     if args.pending:
+        # ★ 2026-10-01：原来只打两个总数（"条目约 N 条，已入库 M 条"）让用户自己减，
+        #   而且 idx 的键和 done 的键来源不同（索引来自 CSV，done 原来是 OCR 现算的）
+        #   ⇒ 那个减法本身也不可靠。现在两边同源，直接列出【还没入库的】。
         print("待下载清单目录：%s" % lm.DOWNLOAD_LIST_DIR)
         files = sorted(glob.glob(os.path.join(lm.DOWNLOAD_LIST_DIR, "*.csv")))
         if not files:
             print("  （还没有清单。跑一次 paper_radar.py 就会生成）")
             return 0
-        total = len(set(id(v) for v in idx.values()))
-        print("  清单文件 %d 份，条目约 %d 条，已入库 %d 条"
-              % (len(files), total, len(done)))
-        for p in files:
-            print("    %s" % os.path.basename(p))
+        # 一个条目可能同时有 doi: 和 title: 两个键 ⇒ 按"条目身份"归并，
+        # 只要它任何一个键在 done 里就算已入库。
+        keys_of, rows_by_id = {}, {}
+        for k, row in idx.items():
+            eid = id(row)
+            keys_of.setdefault(eid, set()).add(k)
+            rows_by_id[eid] = row
+        pending = [rows_by_id[e] for e, ks in keys_of.items() if not (ks & done)]
+        print("  清单文件 %d 份，条目 %d 条，已入库 %d 条，**待下载 %d 条**"
+              % (len(files), len(keys_of), len(keys_of) - len(pending),
+                 len(pending)))
+        print("  清单：%s" % "、".join(os.path.basename(p) for p in files))
+        if pending:
+            print("\n  还没入库的：")
+            for i, row in enumerate(pending, 1):
+                print("   %3d. [%s] %s" % (
+                    i, (row.get("category") or "?"),
+                    (row.get("title") or "")[:70]))
+                if row.get("doi"):
+                    print("        DOI: %s" % row["doi"])
+        else:
+            print("\n  ✓ 清单里的都入库了")
         return 0
 
     if not os.path.isdir(args.dir):
@@ -181,13 +287,17 @@ def main():
                                max_tokens=700, temperature=0.1)
                 meta = rn.parse_json_reply(reply) or {}
 
-                entry, how = match_entry(meta, idx)
+                entry, hit_key, how = match_entry(meta, idx)
                 if entry:
                     cat = entry.get("category") or "其他"
                     note = "清单命中(%s)" % how
                 else:
                     # 清单里没有 → 现场问模型判个主题
-                    rep2 = ai.ask(pngs[:1], CLASSIFY_PROMPT,
+                    # ★ 2026-10-01：原来只送 pngs[:1]。Elsevier/Springer/Wiley 的
+                    #   PDF 首页常是出版社封面页（免责声明 + 期刊 Logo + 版权），
+                    #   真正的标题在第 2 页 ⇒ 只喂第一页模型只能判"其他"。
+                    #   送前 2 页，成本只多一张图。
+                    rep2 = ai.ask(pngs[:2], CLASSIFY_PROMPT,
                                   max_tokens=80, temperature=0.1)
                     m = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", rep2 or "")
                     cat = "其他"
@@ -196,14 +306,15 @@ def main():
                             cat = (json.loads(m.group(0)).get("category") or "其他").strip()
                         except Exception:
                             pass
-                    if cat not in ("优先流", "降雨入渗", "边坡稳定", "方法创新"):
-                        cat = "其他"
+                    cat = normalize_category(cat)
                     note = "清单未命中，模型判定"
+                    if cat == "其他":
+                        note += "（未识别出主题，等人工确认）"
 
                 newname = rn.build_name(meta, args.template,
                                         os.path.splitext(base)[0])
                 dst_dir = os.path.join(lm.LIBRARY_DIR, cat)
-                dst = lm._unique(os.path.join(dst_dir, newname))
+                dst = lm.unique_path(os.path.join(dst_dir, newname))
 
                 if args.dry_run:
                     print("[%d/%d] %s" % (i, len(pdfs), base[:52]))
@@ -212,12 +323,25 @@ def main():
                     import shutil
                     os.makedirs(dst_dir, exist_ok=True)
                     shutil.move(pdf, dst)
-                    os.makedirs(lm.PDF_INBOX_DIR, exist_ok=True)
-                    shutil.copy2(dst, lm._unique(
-                        os.path.join(lm.PDF_INBOX_DIR, newname)))
-                    k = lm.key_of(meta)
+                    # ★ 原子拷贝进 EndNote 监听目录（原来是裸 shutil.copy2）
+                    lm.atomic_copy_into(dst, lm.PDF_INBOX_DIR, newname)
+
+                    # ★ 2026-10-01【销账用哪把键】：优先用 match_entry 在索引里
+                    #   命中的那把【标准键】；meta 是 OCR 产物，连字符/长单词
+                    #   常有微小偏差 ⇒ lm.key_of(meta) 算出来的键可能根本不在
+                    #   索引里，销账销不掉。清单没命中（模型现判）时才退回 OCR 键。
+                    k = hit_key or lm.key_of(meta)
                     if k:
                         done.add(k)
+                    # ★ 2026-10-01：回报中央去重表。原来 manual_ingest 完全
+                    #   活在"状态孤岛"里 —— paper_radar 把这批标成 "listed"，
+                    #   用户手动入库后没有任何一处把它推进到 "filed"，
+                    #   processed.py --stats 永远显示"待下载"。
+                    try:
+                        processed.mark(entry or meta, "filed")
+                        processed._save()
+                    except Exception as _e:
+                        print("        [警告] 中央去重表登记失败：%s" % _e)
                     print("[%d/%d] ✓ [%s] %s   （%s）"
                           % (i, len(pdfs), cat, os.path.basename(dst)[:60], note))
                 ok += 1
