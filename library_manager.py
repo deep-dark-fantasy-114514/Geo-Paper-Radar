@@ -139,6 +139,10 @@ def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None)
     def row(p, i):
         ts = p.get("total_score", 0)
         cat = pick_category(p)
+        # ★ 2026-10-01：作用(adverse/beneficial/both/none) 是用户的核心命题，
+        #   放进主表；尺度与方法放进下面的「逐篇理由」。
+        role = {"adverse": "**不利**", "beneficial": "有利",
+                "both": "两面", "none": "—"}.get(p.get("dual_role", "none"), "—")
         dims = (f"坡{p.get('slope_stability',0)} "
                 f"雨{p.get('rainfall_infiltration',0)} "
                 f"优{p.get('preferential_flow',0)} "
@@ -146,11 +150,11 @@ def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None)
         title = p.get("title", "")
         link = p.get("link", "")
         src = p.get("source", "")
-        return (f"| {i} | **{ts}**/40 | {cat} | {title} | {dims} | "
+        return (f"| {i} | **{ts}**/40 | {cat} | {role} | {title} | {dims} | "
                 f"[链接]({link}) | {src} |")
 
-    head = ("| # | 总分 | 主题 | 标题 | 四维(坡/雨/优/新) | 原文 | 来源 |\n"
-            "|---|------|------|------|------------------|------|------|\n")
+    head = ("| # | 总分 | 主题 | 作用 | 标题 | 四维(坡/雨/优/新) | 原文 | 来源 |\n"
+            "|---|------|------|------|------|------------------|------|------|\n")
 
     L = []
     L.append(f"# 地学文献简报 · {date_str}\n")
@@ -166,6 +170,16 @@ def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None)
         L.append("\n### 逐篇理由\n")
         for i, p in enumerate(pass_list, 1):
             L.append(f"**{i}. {p.get('title','')}**　`{p.get('total_score',0)}/40`\n")
+            _role = {"adverse": "讲不利作用（本人重点）", "beneficial": "讲排水有利（对照文献）",
+                     "both": "两面都讲", "none": "不涉及优先流的作用"}.get(
+                         p.get("dual_role", "none"), "—")
+            _scale = {"pore": "孔隙", "slope": "边坡", "catchment": "流域",
+                      "regional": "区域", "na": "—"}.get(p.get("scale", "na"), "—")
+            _appr = {"numerical": "数值模拟", "experimental": "实验",
+                     "theoretical": "理论", "review": "综述",
+                     "data-driven": "数据驱动", "na": "—"}.get(
+                         p.get("approach", "na"), "—")
+            L.append(f"- 优先流作用：{_role}　｜　尺度：{_scale}　｜　方法：{_appr}")
             if p.get("tldr"):
                 L.append(f"- 创新点：{p['tldr']}")
             if p.get("reason"):

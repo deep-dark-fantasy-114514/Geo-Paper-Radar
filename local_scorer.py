@@ -29,6 +29,9 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import *          # noqa: F401,F403  （RESEARCH_PROFILE 等）
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -44,9 +47,25 @@ DIMS = [
     ("method_innovation",    "方法创新：方法/模型/实验设计的新颖性与突破性"),
 ]
 
-SYSTEM = ("你是一位资深地学审稿专家，专攻地质灾害与水文地质。"
-          "你的任务是对文献做初筛打分，判断它与【碎石土边坡优先流入渗】"
-          "这一研究方向的相关程度。评分要果断、有区分度，不要都给中间分。")
+SYSTEM = (
+    "你是一位资深地学审稿专家，专攻地质灾害与水文地质。"
+    "你的任务是对文献做初筛打分，判断它对下面这位研究者的**研究主线**"
+    "有多大帮助。评分要果断、有区分度，不要都给中间分。\n\n"
+    + RESEARCH_PROFILE +
+    "\n■ 遇到下列主题【直接给 0 分】（它们与本研究完全无关）：\n"
+    "   地震滑坡 / 滑坡动力学与运动学（滑速、运动距离、碎屑流）/ 古滑坡\n"
+)
+
+# 定性字段的采集说明（不计分，只进简报供筛选）
+_QUAL_SPEC = (
+    '\n另外请【不计分地】判断三个属性，一并写进同一个 JSON：\n'
+    '- "dual_role": 优先流在这篇里是加剧还是减轻边坡不稳定。'
+    '取值 adverse(讲不利作用·本人重点) / beneficial(讲排水有利·对照文献) / '
+    'both(两面都讲) / none(不涉及优先流的作用)\n'
+    '- "scale": 研究尺度。pore / slope / catchment / regional / na\n'
+    '- "approach": 主要方法。numerical / experimental / theoretical / review / '
+    'data-driven / na\n'
+)
 
 
 def build_prompt(title, abstract):
@@ -75,8 +94,12 @@ def build_prompt(title, abstract):
             '{"slope_stability":<int>,"rainfall_infiltration":<int>,'
             '"preferential_flow":<int>,"method_innovation":<int>,'
             '"reason":"<20字以内中文理由；若判为无关就写 标题看不出相关性>",'
-            '"tldr":"<一句话>"}'
-            "\n不要输出 total_score，我会自己加。"
+            '"tldr":"<一句话>",'
+            '"dual_role":"<adverse|beneficial|both|none>",'
+            '"scale":"<pore|slope|catchment|regional|na>",'
+            '"approach":"<numerical|experimental|theoretical|review|data-driven|na>"}'
+            + _QUAL_SPEC
+            + "\n不要输出 total_score，我会自己加。"
         )
     return (
         f"{SYSTEM}\n\n"
@@ -90,8 +113,12 @@ def build_prompt(title, abstract):
         f"只输出 JSON，不要解释、不要 markdown 代码块：\n"
         '{"slope_stability":<int>,"rainfall_infiltration":<int>,'
         '"preferential_flow":<int>,"method_innovation":<int>,'
-        '"reason":"<20字以内中文推荐理由>","tldr":"<一句话中文总结其创新点>"}'
-        "\n不要输出 total_score，我会自己加。"
+        '"reason":"<20字以内中文推荐理由>","tldr":"<一句话中文总结其创新点>",'
+        '"dual_role":"<adverse|beneficial|both|none>",'
+        '"scale":"<pore|slope|catchment|regional|na>",'
+        '"approach":"<numerical|experimental|theoretical|review|data-driven|na>"}'
+        + _QUAL_SPEC
+        + "\n不要输出 total_score，我会自己加。"
     )
 
 
@@ -152,6 +179,13 @@ def normalize(raw):
     out["total_score"] = sum(out[k] for k, _ in DIMS)   # ★ 自己加，不信模型
     out["reason"] = str(raw.get("reason", ""))[:60]
     out["tldr"] = str(raw.get("tldr", ""))[:200]
+
+    # ★ 定性字段：**不计分**，只进简报供筛选。取值不在允许集合里就退回 na/none，
+    #   避免模型自由发挥污染筛选。
+    for f, spec in QUALITATIVE_FIELDS.items():
+        v = str(raw.get(f, "")).strip().lower()
+        out[f] = v if v in spec["values"] else (
+            "none" if f == "dual_role" else "na")
     return out
 
 

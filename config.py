@@ -117,6 +117,11 @@ KEYWORD_LIST_CN = [
 ]
 
 # ---- 历史记录 & EndNote ----
+# ---- ★ 2026-10-01：研究画像 + 主题黑名单（定义在 research_profile.py，改那里即可）----
+from research_profile import (RESEARCH_PROFILE, BLACKLIST_TOPICS,
+                              BLACKLIST_DROP, BLACKLIST_TITLE_ONLY,
+                              QUALITATIVE_FIELDS)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 ENDNOTE_WATCH_DIR = os.path.join(BASE_DIR, "EndNote_Watch")

@@ -158,3 +158,40 @@ def dual_track_filter(papers):
     print(f"  [通关] {len(pass_list)} 篇 → 推送邮件 + .ris")
     print(f"  [备选] {len(browsing_list)} 篇 → 仅终端 + .ris")
     return pass_list, browsing_list
+
+
+# ══════════════════════════════════════════════
+# ★ 2026-10-01：主题黑名单预筛
+# ══════════════════════════════════════════════
+def blacklist_filter(papers, terms=None, drop=None):
+    """把「用不上」的主题直接刷掉，**放在打分之前** ⇒ 省下这些篇的打分时间。
+
+    黑名单在 research_profile.BLACKLIST_TOPICS，用户原话：
+      「地震滑坡、滑坡动力学、古滑坡等，我完全用不上，遇到可以直接刷掉」
+
+    匹配范围：标题 + （有摘要时）摘要。**无摘要的只匹配标题**——
+    闭源论文只有标题可比，硬匹配摘要字段会把 "No abstract available" 也算进去。
+
+    返回 (保留, 被刷掉) 两个列表。
+    """
+    terms = BLACKLIST_TOPICS if terms is None else terms
+    drop = BLACKLIST_DROP if drop is None else drop
+    lows = [t.lower() for t in terms]
+    kept, killed = [], []
+    for p in papers:
+        text = (p.get("title") or "")
+        if not BLACKLIST_TITLE_ONLY and not _no_abstract(p):
+            text += " " + (p.get("summary") or "")
+        text = text.lower()
+        hit = next((t for t in lows if t in text), None)
+        if not hit:
+            kept.append(p)
+            continue
+        p["_blacklist_hit"] = hit
+        if drop:
+            killed.append(p)
+        else:                       # 保留但强制 0 分
+            p["total_score"] = 0
+            p["reason"] = "拉黑主题：" + hit
+            kept.append(p)
+    return kept, killed

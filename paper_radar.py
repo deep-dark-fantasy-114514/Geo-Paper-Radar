@@ -25,7 +25,7 @@ from sources import (fetch_papers_from_rss, OpenAlexFetcher,   # noqa: F401
                      fetch_openalex_dissertations, fetch_openalex_journals,
                      dedupe_by_title)
 from filters import (local_regex_coarse_filter,          # noqa: F401
-                     limit_for_deepseek, dual_track_filter)
+                     limit_for_deepseek, dual_track_filter, blacklist_filter)
 from scoring import score_all_papers                     # noqa: F401
 from download import download_oa_pdf, download_all_oa_pdfs   # noqa: F401
 from output import (generate_ris_file, build_html_email_v3,  # noqa: F401
@@ -170,6 +170,21 @@ def main():
         coarse_papers = processed.filter_new(coarse_papers)
     except Exception as e:
         print(f"  [警告] 去重表不可用，本轮按不去重处理：{e}")
+
+    # B2b: ★ 主题黑名单预筛（2026-10-01）
+    # 用户原话：「地震滑坡、滑坡动力学、古滑坡等，我完全用不上，遇到可以直接刷掉」
+    # 放在打分之前 ⇒ 这些篇根本不用花那 1.4 秒。
+    try:
+        before = len(coarse_papers)
+        coarse_papers, _killed = blacklist_filter(coarse_papers)
+        if _killed:
+            print(f"  [拉黑] 刷掉 {len(_killed)} 篇（{before} → {len(coarse_papers)}）")
+            for _p in _killed[:5]:
+                print(f"     ✗ [{_p.get('_blacklist_hit')}] {_p.get('title','')[:56]}")
+            if len(_killed) > 5:
+                print(f"     …另有 {len(_killed)-5} 篇")
+    except Exception as e:
+        print(f"  [警告] 黑名单预筛失败，本轮不过滤：{e}")
 
     # B3: 限流
     # ★ 2026-10-01：本地打分免费 ⇒ 默认【不设上限】，粗筛通过的全送。

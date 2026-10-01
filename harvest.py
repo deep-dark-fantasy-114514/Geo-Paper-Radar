@@ -20,7 +20,7 @@ from sources import (fetch_papers_from_rss, OpenAlexFetcher,
                      fetch_crossref, fetch_crossref_journals,
                      fetch_openalex_dissertations, fetch_openalex_journals,
                      dedupe_by_title)
-from filters import local_regex_coarse_filter
+from filters import local_regex_coarse_filter, blacklist_filter
 
 
 def fetch_all_candidates():
@@ -99,6 +99,9 @@ def run_harvest():
         print("[结果] 没抓到任何候选")
         return 0
     kept = local_regex_coarse_filter(cand, min_hits=COARSE_MIN_HITS)
+    kept, _bl = blacklist_filter(kept)      # ★ 拉黑主题先刷掉，省存储
+    if _bl:
+        print(f'  [拉黑] 刷掉 {len(_bl)} 篇')
     slim = []
     for p in kept[:HARVEST_MAX]:
         rec = {k: p.get(k) for k in HARVEST_FIELDS}
