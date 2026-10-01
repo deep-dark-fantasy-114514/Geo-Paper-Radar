@@ -522,10 +522,19 @@ def main():
             _sys.path.insert(0, BASE_DIR)
         import library_manager as _lm
         _lm.ensure_dirs()
+        # ★ 2026-10-01：把【实际】用的打分器传进去 —— 本地挂掉静默回退
+        #   DeepSeek 时，简报原来照样写"本地模型打分"。
+        _sc_name = None
+        try:
+            import scoring as _scm
+            _sc_name = (getattr(_scm, "LAST_RUN", {}) or {}).get("scorer")
+        except Exception:
+            pass
         digest_path = _lm.build_digest(pass_list, browsing_list,
                                        len(scored_papers),
                                        time.time() - start_time,
-                                       titleonly=titleonly_list)
+                                       titleonly=titleonly_list,
+                                       scorer=_sc_name)
         print(f"\n📋 文献简报：{digest_path}")
     except Exception as e:
         print(f"\n[警告] 简报生成失败：{type(e).__name__}: {e}")

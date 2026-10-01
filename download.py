@@ -309,10 +309,15 @@ def download_all_oa_pdfs(papers):
                 else:
                     filed.append(fp)
                 continue
-            dst, cat = lm.file_paper(
-                fp, p, ai=ai, rn=rn,
-                do_rename=(AUTO_RENAME_PDF and ai is not None))
-            if dst:
+            # ★ 2026-10-01：file_paper 现在返回三元组，第三个是"是否已成功
+            #   投递 PDF_Inbox"。Library 归档成功 ≠ EndNote 收到了 ——
+            #   只有【两个目标都成功】才算 settled。否则这篇会被登记成 filed、
+            #   次日既不重试也不进待下载清单，**PDF 永远进不了 EndNote**。
+            _r = lm.file_paper(fp, p, ai=ai, rn=rn,
+                               do_rename=(AUTO_RENAME_PDF and ai is not None))
+            dst, cat = (_r[0], _r[1]) if isinstance(_r, tuple) else (_r, None)
+            inbox_ok = _r[2] if (isinstance(_r, tuple) and len(_r) > 2) else bool(dst)
+            if dst and inbox_ok:
                 filed.append(dst)
                 try:
                     filed_keys.add(lm.key_of(p))
@@ -320,6 +325,9 @@ def download_all_oa_pdfs(papers):
                     pass
                 print(f"  📁 [{cat}] {os.path.basename(dst)[:66]}")
             else:
+                # dst 非空只可能是"Library 成了但 Inbox 没成"以外的异常组合；
+                # 新实现里 Inbox 失败会直接 return None（原件仍留在暂存区），
+                # 所以这里统一按"未完成"处理，交回 failed_p 走重试。
                 failed_p.append((p, fp))
     finally:
         # 只要服务器起来过（或可能起过），就一定要收 —— 按标志判断，不看 ai 是不是 None

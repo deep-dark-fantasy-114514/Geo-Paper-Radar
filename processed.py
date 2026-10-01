@@ -48,7 +48,7 @@ except Exception:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-from config import norm_title          # noqa: E402  全仓唯一的标题清洗实现
+from config import norm_title, canonical_doi    # noqa: E402  全仓唯一实现
 
 FILE = os.path.join(BASE_DIR, "processed.json")
 
@@ -68,8 +68,7 @@ def key_of(paper):
       已经漂了（manual_ingest 那份漏了"剥标签"）。三份算法算出三把键，
       跨清单匹配（download_list ↔ processed ↔ 销账）就可能对不上。
     """
-    doi = re.sub(r"^https?://(dx\.)?doi\.org/",
-                 "", (paper.get("doi") or "").strip(), flags=re.I).strip().lower()
+    doi = canonical_doi(paper.get("doi")).lower()
     if doi:
         return "doi:" + doi
     return "title:" + norm_title(paper.get("title"))[:120]

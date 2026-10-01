@@ -439,6 +439,30 @@ def safe_filename(text, max_len=40):
     return safe
 
 
+def canonical_doi(doi):
+    """DOI 规范化：URL/`doi:` 前缀、末尾标点、查询串、大小写外的空白。
+
+    ★ 2026-10-01：**全仓唯一实现**。原来各处各写一遍，且能力参差：
+      · `processed.key_of` / `library_manager._clean_doi` 只剥 `https?://(dx.)?doi.org/`
+      · 出版商的元数据里还常见 `doi:10.xxxx/yyy`、`10.xxxx/yyy.`（句末点）、
+        `10.xxxx/yyy).`（参考文献里带括号的）、`?param=1` 尾巴 —— 全都不处理。
+      `key_of` 用 `.lower()` 后的结果当键，CSV/RIS/待下载清单用的是展示形式，
+      所以这里**只做规范化、不转大小写**，由调用方决定。
+
+    返回裸 DOI（如 `10.1016/j.enggeo.2026.107001`），取不到就返回 ""。
+    """
+    d = str(doi or "").strip()
+    if not d:
+        return ""
+    d = re.sub(r"^\s*(?:doi\s*:\s*)", "", d, flags=re.I)          # doi:10.x/y
+    d = re.sub(r"^\s*https?://(?:dx\.)?doi\.org/", "", d, flags=re.I)
+    d = d.split("?", 1)[0].split("#", 1)[0]                        # 去查询串/锚点
+    d = d.strip().strip(" \t\r\n.,;:)]}。，")               # 去首尾标点
+    # 只认 `10.xxxx/...` 这种形状。取不到就返回 "" ——
+    # 这样 `key_of` 会退回按标题去重，而不是拿一段乱码当唯一键。
+    return d if re.match(r"^10\.\d{4,}/\S+$", d) else ""
+
+
 def no_abstract(p_or_summary):
     """判断"这篇没有摘要"。
 
