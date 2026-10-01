@@ -328,7 +328,12 @@ def main():
     # ==========================
     # 下到 PDF_Inbox ⇒ EndNote 的「PDF 自动导入文件夹」会自动入库，
     # 从而免去"去 QQ 邮箱手动下载 .ris 再导入"这一步。
-    pdf_saved, filed_keys = download_all_oa_pdfs(pass_list + browsing_list)
+    pdf_saved, filed_keys, deferred_keys = download_all_oa_pdfs(pass_list + browsing_list)
+    # ★ 2026-10-01：deferred_keys = 因本轮的 PDF_MAX_PER_RUN 限额而【没下】的。
+    #   它们【不能】被打上 listed，否则 processed.filter_new 次日永久拦掉它们，
+    #   本来能自动下载的 OA 文献仅因排在第 21 篇之后就被迫转手动。
+    #   这里把它们当作'已处理'一起排除，等下一轮自动补下。
+    _settled = filed_keys | deferred_keys
 
     # ==========================
     # 阶段 F2: ★ 待下载清单（2026-10-01 新增）
@@ -344,13 +349,13 @@ def main():
         import library_manager as _lm2
         _lm2.ensure_dirs()
         dl_csv, dl_n = _lm2.build_download_list(
-            pass_list + browsing_list + titleonly_list, filed_keys)
+            pass_list + browsing_list + titleonly_list, _settled)
         if dl_csv:
             # ★ 登记为 listed，避免同一篇明天又被列一次
             try:
                 import processed as _proc
                 for _p in (pass_list + browsing_list):
-                    if _proc.key_of(_p) not in filed_keys:
+                    if _proc.key_of(_p) not in _settled:
                         _proc.mark(_p, "listed")
                 _proc._save()
             except Exception:

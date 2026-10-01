@@ -7,9 +7,12 @@
 实测自动下载成功率约 30%：Copernicus / Frontiers 可下，Wiley / MDPI 硬 403。
 下不到的进「待下载清单」，由 manual_ingest.py 处理你手动下载的 PDF。
 """
+import hashlib
+import html as _html
 import os
 import re
 import sys
+import tempfile
 import urllib.parse
 from datetime import datetime
 
@@ -18,22 +21,36 @@ import requests
 from config import *
 
 
-def _grab(url, hdr):
-    """取一个 URL 的内容，带体积上限。返回 (blob, content_type, status, truncated)。"""
+def _grab(url, hdr, sink=None):
+    """取一个 URL 的内容，带体积上限。
+
+    ★ 2026-10-01 两处修正：
+      1. 用 `with requests.get(..., stream=True) as r:` —— 原来 stream=True 却
+         没有关连接，截断（break）或异常退出时套接字会一直挂着不释放。
+      2. 传了 sink（一个已打开的二进制文件）就**边下边写**，不再
+         `chunks.append` 再 `b"".join()` —— 后者会把整个文件（上限 60 MB）
+         堆在内存里再拷一遍。
+
+    返回 (blob, content_type, status, truncated)。
+    传了 sink 时 blob 为 b""（内容已落盘），用 file_size 取大小。
+    """
     cap = PDF_MAX_MB * 1024 * 1024
-    r = requests.get(url, headers=hdr, timeout=REQUEST_TIMEOUT,
-                     stream=True, allow_redirects=True)
-    if r.status_code != 200:
-        return b"", (r.headers.get("Content-Type") or "").lower(), r.status_code, False
     chunks, size, trunc = [], 0, False
-    for ch in r.iter_content(65536):
-        if not ch:
-            continue
-        chunks.append(ch)
-        size += len(ch)
-        if size > cap:
-            trunc = True
-            break
+    with requests.get(url, headers=hdr, timeout=REQUEST_TIMEOUT,
+                      stream=True, allow_redirects=True) as r:
+        if r.status_code != 200:
+            return b"", (r.headers.get("Content-Type") or "").lower(), r.status_code, False
+        for ch in r.iter_content(65536):
+            if not ch:
+                continue
+            size += len(ch)
+            if size > cap:
+                trunc = True
+                break
+            if sink is not None:
+                sink.write(ch)
+            else:
+                chunks.append(ch)
     return (b"".join(chunks), (r.headers.get("Content-Type") or "").lower(),
             200, trunc)
 
@@ -54,7 +71,10 @@ def _find_pdf_url(html_bytes, base_url):
     for pat in _META_PDF_PATTERNS:
         m = re.search(pat, html, re.I)
         if m:
-            u = urllib.parse.urljoin(base_url, m.group(1).strip())
+            # ★ 2026-10-01：出版商 meta 里的 URL 常写成 /dl?id=1&amp;type=pdf，
+            #   不反转义就带着 &amp; 去请求 ⇒ 服务器当非法参数返 400/404。
+            raw = _html.unescape(m.group(1).strip())
+            u = urllib.parse.urljoin(base_url, raw)
             if u.startswith("http"):
                 return u
     return None
@@ -81,7 +101,14 @@ def download_oa_pdf(paper):
         score = paper.get("total_score", 0)
         ds = paper.get("data_source", "RSS")
         date_str = datetime.now().strftime("%Y-%m-%d")
-        filename = f"{date_str}_{ds[:4]}_{score}分_{safe_filename(title, 40)}.pdf"
+        # ★ 2026-10-01：文件名加一段【URL 哈希尾缀】。
+        #   原来只截标题前 40 字 —— 地学论文标题高度同质
+        #   （"Numerical simulation of rainfall infiltration in…"），
+        #   同分同源的两篇一旦前 40 字相同就会撞名，后一篇被
+        #   `os.path.exists` 误判为"已下载"而直接跳过。
+        _h = hashlib.md5(url.encode("utf-8")).hexdigest()[:6]
+        filename = (f"{date_str}_{ds[:4]}_{score}分_"
+                    f"{safe_filename(title, 34)}_{_h}.pdf")
         filepath = os.path.join(PDF_INBOX_DIR, filename)
         if os.path.exists(filepath):          # 幂等
             return filepath
@@ -104,21 +131,42 @@ def download_oa_pdf(paper):
         # ★ 2026-10-01：拿到 HTML 说明这是【落地页】而不是 PDF。
         #   出版商普遍用 <meta name="citation_pdf_url"> 官方声明 PDF 直链
         #   （Springer / AGU / Wiley 等都遵守），顺着它再取一次。
-        if not blob.startswith(b"%PDF"):
+        # ★ 2026-10-01：7 宽松魔数（BOM / 前导空白会让 startswith 误杀）
+        if b"%PDF" not in blob[:1024]:
             real = _find_pdf_url(blob, url)
             if real:
-                b2, c2, st2, tr2 = _grab(real, hdr)
+                # ★ 2026-10-01：从落地页二次抓取时，Referer 要换成【落地页】。
+                #   原来一直带着原文的 doi.org 链接，出版商防盗链会判 403。
+                hdr2 = dict(hdr)
+                hdr2["Referer"] = url
+                b2, c2, st2, tr2 = _grab(real, hdr2)
                 if st2 == 200 and not tr2 and b2.startswith(b"%PDF"):
                     blob, ctype = b2, c2
-        if not blob.startswith(b"%PDF"):
+        if b"%PDF" not in blob[:1024]:
             print(f"     ⚠ 不是 PDF（{ctype or '未知类型'}）：{title[:40]}")
             return None
         if len(blob) < PDF_MIN_BYTES:
             print(f"     ⚠ PDF 过小（{len(blob)} B），丢弃：{title[:40]}")
             return None
 
-        with open(filepath, "wb") as f:
-            f.write(blob)
+        # ★ 2026-10-01：改为【临时文件 + os.replace 原地重命名】。
+        #   PDF_INBOX_DIR 是 EndNote 实时监视的自动导入目录 ——
+        #   直接写目标路径的话，写入的那几百毫秒里 EndNote 可能抢读到
+        #   半截文件；进程中途被杀也会留下损坏的 PDF。
+        #   （processed.py / save_history 早就是原子写，这里补齐。）
+        fd, tmp = tempfile.mkstemp(suffix=".downloading", dir=PDF_INBOX_DIR)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(blob)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, filepath)
+        except Exception:
+            try:
+                os.path.exists(tmp) and os.remove(tmp)
+            except Exception:
+                pass
+            raise
         return filepath
     except Exception as e:
         print(f"     ⚠ PDF 下载失败（{type(e).__name__}）：{str(e)[:60]}")
@@ -133,7 +181,7 @@ def download_all_oa_pdfs(papers):
     """
     if not PDF_DOWNLOAD_ENABLED:
         print("\n  [PDF] 自动下载已关闭（PDF_DOWNLOAD_ENABLED=False）")
-        return [], set()
+        return [], set(), set()
     oa_papers = [p for p in papers if p.get("oa_pdf_url")]
     print(f"\n{'=' * 60}")
     print(f"【OA PDF 下载 → 重命名 → 归档】{len(oa_papers)}/{len(papers)} 篇有 OA 链接"
@@ -141,9 +189,18 @@ def download_all_oa_pdfs(papers):
     print("=" * 60)
     if not oa_papers:
         print("  本轮无 OA 链接可直接下载（其余进待下载清单，等手动下载）")
-        return [], set()
+        return [], set(), set()
 
     batch = oa_papers[:PDF_MAX_PER_RUN]
+    # ★ 2026-10-01：记下【因为限额而没下】的那些。
+    #   它们不能被打上 "listed" —— 否则 processed.filter_new 次日会永久拦掉它们，
+    #   本来能自动下载的 OA 文献（仅因排在第 21 篇之后）被迫转手动，违背自动化初衷。
+    deferred_keys = set()
+    for _p in oa_papers[PDF_MAX_PER_RUN:]:
+        try:
+            deferred_keys.add(_p.get("doi", "") or (_p.get("title", "") or ""))
+        except Exception:
+            pass
     # 先把 PDF 都下下来（不依赖本地模型）
     downloaded = []
     for p in batch:
@@ -154,11 +211,18 @@ def download_all_oa_pdfs(papers):
     print(f"  [下载] 成功 {len(downloaded)}/{len(batch)} 篇")
 
     if not downloaded:
-        return [], set()
+        return [], set(), set()
 
     # 再统一重命名 + 归档（本地模型只起停一次）
     lm = None
     ai = rn = None
+    # ★ 2026-10-01：用【独立标志】记录服务器是否真的起来过。
+    #   原来是失败时 `ai = rn = None` —— 这会让 finally 里的
+    #   `if ai is not None: ai.stop_server()` 永远执行不到。
+    #   ★ 真正可达的触发点：ask_image.start_server() 在**超时**时返回 False
+    #     却【不杀进程】，此时把它置 None ⇒ 孤立的 llama-server
+    #     一直占着几 GB 显存，后续任务全部 OOM。
+    _server_up = [False]
     if AUTO_FILE_TO_LIBRARY or AUTO_RENAME_PDF:
         try:
             import sys as _sys
@@ -170,13 +234,16 @@ def download_all_oa_pdfs(papers):
                 ai = lm._load_module(lm.ASK_IMAGE, "ask_image")
                 rn = lm._load_module(lm.RENAMER, "rename_pdfs_ai")
                 if not ai.health():
-                    if not ai.start_server():
+                    if ai.start_server():
+                        _server_up[0] = True
+                    else:
                         print("  [警告] 本地模型起不来，本轮跳过重命名（PDF 仍会归档）")
-                        ai = rn = None
+                        rn = None          # ai 保留，交给 finally 收尾（可能有余留进程）
         except Exception as e:
             print(f"  [警告] 归档模块加载失败：{e}")
             lm = None
-            ai = rn = None
+            rn = None
+            # 注意：**不把 ai 置 None** —— 万一服务器已经起来了，得让它被收掉
 
     filed, filed_keys = [], set()
     try:
@@ -195,6 +262,7 @@ def download_all_oa_pdfs(papers):
                     pass
                 print(f"  📁 [{cat}] {os.path.basename(dst)[:66]}")
     finally:
+        # 只要服务器起来过（或可能起过），就一定要收 —— 按标志判断，不看 ai 是不是 None
         if ai is not None:
             try:
                 ai.stop_server()
@@ -212,4 +280,7 @@ def download_all_oa_pdfs(papers):
         print(f"  [警告] 归档登记失败：{e}")
 
     print(f"  [汇总] 已归档 {len(filed)} 篇到 {lm.LIBRARY_DIR if lm else PDF_INBOX_DIR}")
-    return filed, filed_keys
+    if deferred_keys:
+        print(f"  [本轮限额] 另有 {len(deferred_keys)} 篇有 OA 直链但排在 {PDF_MAX_PER_RUN} 之后，"
+              f"下轮自动补下（不会进待下载清单）")
+    return filed, filed_keys, deferred_keys
