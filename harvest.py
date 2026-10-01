@@ -107,8 +107,13 @@ def run_harvest():
     print("#" * 62)
     cand = fetch_all_candidates()
     if not cand:
-        print("[结果] 没抓到任何候选")
-        return 0
+        # ★ 2026-10-01：这里改返回 1。实测每天稳定有 ~1800 篇候选，
+        #   "一篇都没抓到"几乎一定是网络/API/KEY 出了问题，不是"今天没文献"。
+        #   而之前返回 0 ⇒ plan_radar 的 sys.exit(main()) 拿到 0 ⇒
+        #   GitHub Actions 显示绿色 ⇒ **云端悄悄失效你根本不会知道**。
+        print("[结果] 没抓到任何候选 —— 多半是数据源/API Key 出问题了，"
+              "请查看上面的 [Warning] 行")
+        return 1
     kept = local_regex_coarse_filter(cand)   # 走加权分规则
     kept, _bl = blacklist_filter(kept)      # ★ 拉黑主题先刷掉，省存储
     if _bl:

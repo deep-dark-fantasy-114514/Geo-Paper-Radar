@@ -11,6 +11,7 @@ PDF_Inbox/
 PDF_Temp/     # ★ OA PDF 的暂存区（下载→重命名→归档 之间）。不归档时不用
 .harvest_consumed.json
 processed.json
+pending_email.json   # ★ 邮件发失败时暂存的"待补发"文献，本机状态，不进仓库
 *.bak*        # 含 .bak_ / .bak2_ / .bak3_ 等所有变体
 
 # 注意：harvest/ 必须【提交】——那是云端在笔记本睡着时攒下的候选，

@@ -154,12 +154,20 @@ def score_titleonly_with_deepseek(title, retries=2):
         return None
 
 
+# ★ 2026-10-01：记录【实际】跑了哪个打分器。原来日志是按配置变量 SCORER
+#   打印的，而本地 Qwen 挂掉时会静默回退 DeepSeek —— 于是日志显示"免费"，
+#   实际在按量计费。成本判断不能靠配置猜，要记事实。
+LAST_RUN = {"scorer": None, "count": 0, "fallback": False}
+
+
 def score_all_papers(papers, phase_label="DeepSeek"):
     """对文献列表打分。
 
     ★ 2026-10-01：默认走【本地 Qwen3.5-9B】（免费、0.7~1.1 s/篇），
     规模从 40 放开到 MAX_CANDIDATES=500。本地不可用时自动回退 DeepSeek。
+    实际用了哪个记在 `LAST_RUN`（调用方可据此报成本）。
     """
+    LAST_RUN.update({"scorer": None, "count": 0, "fallback": False})
     if SCORER == "local" and papers:
         print("\n" + "=" * 60)
         print(f"【第二阶段】本地 Qwen3.5-9B 多维度打分（免费，共 {len(papers)} 篇）")
@@ -178,8 +186,11 @@ def score_all_papers(papers, phase_label="DeepSeek"):
                                        else ("normal" if ts >= BROWSING_THRESHOLD
                                              else "weak"))
                 p["score"] = round(ts / 40 * 100)
+            LAST_RUN.update({"scorer": "本地 Qwen3.5-9B",
+                             "count": len(scored), "fallback": False})
             return scored
         print("  [回退] 本地打分不可用，改用 DeepSeek")
+        LAST_RUN["fallback"] = True
         # ★★★ 2026-10-01【安全熔断】★★★
         #   main() 里的 _cap 是按【配置的 SCORER】算的：配成 local 时
         #   MAX_CANDIDATES=None ⇒ 走"不截断"分支。可本地一旦挂掉就回退到这里，
@@ -239,6 +250,9 @@ def score_all_papers(papers, phase_label="DeepSeek"):
         time.sleep(0.5)
 
     print(f"\n[汇总] 成功打分 {len(scored)}/{total} 篇")
+    LAST_RUN.update({"scorer": "DeepSeek",
+                     "count": len(scored),
+                     "fallback": bool(LAST_RUN.get("fallback"))})
     return scored
 
 

@@ -130,10 +130,12 @@ def mark(paper, status="seen", score=None):
     d = load()
     today = time.strftime("%Y-%m-%d")
     old = d.get(k)
-    # ⚠️ failed 必须排在 seen 之后：mark() 是"只升不降"的，如果 failed 排在
-    #    seen 前面，"打分后被标 seen" 就会把它顶掉 ⇒ 永远记不上 failed ⇒
-    #    次日不重试（这正是要修的那个 bug）。而重试成功写 filed(4) 仍能覆盖它。
-    rank = {"seen": 1, "failed": 2, "listed": 3, "filed": 4}
+    # ⚠️ failed / deferred 必须排在 seen 之后：mark() 是"只升不降"的，如果它们
+    #    排在 seen 前面，"打分后被标 seen" 就会把它们顶掉 ⇒ 永远记不上 ⇒
+    #    次日不重试（这正是要修的那个 bug）。而重试成功写 filed(4) 仍能覆盖。
+    # ★ 2026-10-01 新增 "deferred"：本轮因 PDF_MAX_PER_RUN 限额【没轮到下载】。
+    #   见 filter_new 的说明 —— 它和 failed 一样必须可重试。
+    rank = {"seen": 1, "failed": 2, "deferred": 2, "listed": 3, "filed": 4}
     old_status = old[1] if (isinstance(old, list) and len(old) > 1) else None
     if old_status and rank.get(old_status, 0) > rank.get(status, 0):
         status = old_status              # 保留更"靠后"的状态
@@ -162,13 +164,27 @@ def mark_many(papers, status="seen"):
     _save()
 
 
-def filter_new(papers):
-    """返回【没处理过】的那些。放在打分之前调用，省下重复打分的时间。
+RETRYABLE = ("failed", "deferred")   # 这两种状态要放行重试，见下
 
-    ★ 2026-10-01：状态为 "failed"（归档失败）的【放行】。
-      原来只要键在表里就一律拦掉 —— 于是"下载下来了但归档时被
-      EndNote 锁住"的那篇次日永远不会重试，中文重命名与 Library 归
-      档对它永久失效。现在给 failed 第二次机会。
+
+def filter_new(papers):
+    """返回【没处理过】的，外加【该重试】的。放在打分之前调用。
+
+    ★ 2026-10-01：状态为 "failed" / "deferred" 的【放行】。
+      原来只要键在表里就一律拦掉，而这会踩死两条路：
+
+      · **failed**（归档失败）：文件下下来了但归档时被 EndNote 锁住 ⇒
+        中文重命名与 Library 归档永久失效。
+
+      · **deferred**（本轮 PDF_MAX_PER_RUN 限额没轮到）：这是更隐蔽的一条。
+        `paper_radar` 在【下载之前】就把所有打过分的一律标成 seen，
+        然后下载时才发现"第 21 篇之后的下不了"，把它记进 deferred_keys。
+        可它早就被标成 seen 了 ⇒ 次日 filter_new 直接拦掉 ⇒
+        **既不会被自动补下，又被 `_settled` 排除在待下载清单之外 —— 彻底掉进黑洞**。
+        （原注释写的"下轮自动补下"从来没有对应的机制。）
+
+      放行时打 `_retry_archive` 标记，让 paper_radar 把这篇【无条件】塞进
+      下载/归档批次，并【排在最前面】—— 否则它会排在队尾再被限额切掉一次。
     """
     d = load()
     out, skipped, retry = [], 0, 0
@@ -178,21 +194,18 @@ def filter_new(papers):
         st = None
         if rec is not None:
             st = rec[1] if isinstance(rec, list) and len(rec) > 1 else "seen"
-        if rec is not None and st != "failed":
+        if rec is not None and st not in RETRYABLE:
             skipped += 1
             continue
-        if st == "failed":
+        if st in RETRYABLE:
             retry += 1
-            # ★ 打标记，让 paper_radar 把这篇【无条件】塞进下载/归档批次。
-            #   否则它要重新挤过 pass/browse 阈值才轮得到重试；而重新打分
-            #   （temperature 0.1，非严格确定）万一低了 1 分，这篇就永远
-            #   出不了 failed —— 归档重试机制形同虚设。
             p["_retry_archive"] = True
         out.append(p)
     if skipped:
         print("  [去重] 已处理过 %d 篇，跳过；本轮新文献 %d 篇" % (skipped, len(out)))
     if retry:
-        print("  [重试] 其中 %d 篇上次归档失败，本轮重走下载/归档" % retry)
+        print("  [重试] 其中 %d 篇上次归档失败/被限额推迟，本轮优先重走下载归档"
+              % retry)
     return out
 
 

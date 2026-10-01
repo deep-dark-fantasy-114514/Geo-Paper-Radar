@@ -229,15 +229,27 @@ def download_all_oa_pdfs(papers):
         return [], set(), set()
 
     batch = oa_papers[:PDF_MAX_PER_RUN]
-    # ★ 2026-10-01：记下【因为限额而没下】的那些。
-    #   它们不能被打上 "listed" —— 否则 processed.filter_new 次日会永久拦掉它们，
-    #   本来能自动下载的 OA 文献（仅因排在第 21 篇之后）被迫转手动，违背自动化初衷。
+    # ★ 2026-10-01：记下【因为限额而没下】的那些，并**登记成可重试的 "deferred"**。
+    #   ⚠️ 踩过的坑：原来这里只是把它们收进 deferred_keys 供【本轮】排除，
+    #      指望"下轮自动补下"——但根本没有任何机制把它们带回下一轮，
+    #      而且 paper_radar 早在下载之前就把所有打过分的一律标成了 "seen"，
+    #      filter_new 次日直接拦掉 ⇒ 既不会被自动补下，又被 _settled 排除在
+    #      待下载清单之外 —— **彻底掉进黑洞**。
+    #      现在显式标 "deferred"，filter_new 见到它会放行并排到批次最前面。
     deferred_keys = set()
-    for _p in oa_papers[PDF_MAX_PER_RUN:]:
-        try:
-            deferred_keys.add(_p.get("doi", "") or (_p.get("title", "") or ""))
-        except Exception:
-            pass
+    deferred_papers = oa_papers[PDF_MAX_PER_RUN:]
+    try:
+        import processed as _proc
+        for _p in deferred_papers:
+            try:
+                deferred_keys.add(_proc.key_of(_p))
+                _proc.mark(_p, "deferred")
+            except Exception:
+                pass
+        if deferred_papers:
+            _proc._save()
+    except Exception as e:
+        print(f"  [警告] deferred 登记失败：{str(e)[:60]}")
     # 先把 PDF 都下到【暂存区】（不依赖本地模型，也避开 EndNote 的监听目录）
     _n_swept = _sweep_stage()
     if _n_swept:
