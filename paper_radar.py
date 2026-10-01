@@ -180,6 +180,25 @@ CROSSREF_QUERIES = [
 CROSSREF_ROWS = 200           # 每组查询取多少（Crossref 单次硬上限 1000）
 USE_ARXIV = False             # 预印本，地学覆盖小，默认关
 
+# ---- ★ 2026-10-01 新增：学位论文 + 中文核心刊 ----
+# 学位论文：OpenAlex 实测近 3 年 landslide rainfall 497 篇、preferential flow soil
+#   1,153 篇，绝大多数带摘要 ⇒ 值得收。相关性匹配较松（会混进化学/医学的），
+#   但打分免费，交给本地模型筛。
+# 中文核心刊：**只能靠 ISSN 查 OpenAlex**（Crossref 几乎没有）。
+#   ⚠️ OpenAlex 的 language 字段不可靠（中文刊常标成 en）⇒ 用 issn 不用 language。
+#   ⚠️ 只能到"题目级别"：近半年收录有滞后，且无摘要、标题是英译。
+USE_DISSERTATIONS = True
+DISSERTATION_QUERIES = [
+    "landslide rainfall slope",
+    "preferential flow soil macropore",
+    "slope stability unsaturated soil",
+    "rainfall infiltration slope failure",
+]
+DISSERTATION_DAYS = 365       # 学位论文回看 1 年
+DISSERTATIONS_PER_QUERY = 60
+USE_CN_JOURNALS = True
+CN_JOURNAL_DAYS = 90
+
 # ---- ★ 摘要补全 ----
 # 背景：闭源论文在 OpenAlex 的摘要覆盖只有约 24%（Elsevier/Wiley 不交摘要给 Crossref）。
 #   · Crossref 补：对这一领域实测 0/25 —— Elsevier/Springer 根本没交，白搭但便宜
@@ -393,21 +412,27 @@ class OpenAlexFetcher:
         return f"{OPENALEX_BASE_URL}/works?{urllib.parse.urlencode(params)}"
 
     def _fetch_single_query(self, query):
-        """执行单个关键词查询并解析结果"""
+        """执行单个关键词查询并解析结果。
+
+        ★ 2026-10-01 修：原来用裸 `requests.get`，**完全没有退避重试** ——
+        实测 OpenAlex 一限流就把 6 组查询全打成 0 篇，**910 篇覆盖悄无声息地没了**。
+        现在改走 `sources.polite_get()`：指数退避 + 读 Retry-After + 查询间隔 ≥1s。
+        """
         url = self._build_search_url(query)
         try:
-            resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            import sources as _src
+            data = _src.polite_get(url, min_gap=1.0, retries=5)
+            if data is None:
+                return [], 0
             papers = []
-            for work in results:
+            for work in data.get("results", []):
                 paper = self._parse_work(work)
                 if paper:
                     papers.append(paper)
-            meta = data.get("meta", {})
-            count = meta.get("count", 0)
-            return papers, count
+            return papers, (data.get("meta") or {}).get("count", 0)
         except Exception as e:
             print(f"  [Warning] 查询 '{query[:20]}' 失败: {e}")
             return [], 0
@@ -1217,6 +1242,22 @@ def fetch_all_candidates():
         except Exception as e:
             print(f"  [Warning] Crossref 抓取失败：{e}")
 
+    # ★ 学位论文 + 中文核心刊（云端 harvest 也要，否则笔记本睡着的那些天收不到）
+    if USE_DISSERTATIONS:
+        try:
+            import sources as _src
+            all_papers.extend(_src.fetch_openalex_dissertations(
+                DISSERTATION_QUERIES, days=DISSERTATION_DAYS,
+                per_query=DISSERTATIONS_PER_QUERY))
+        except Exception as e:
+            print(f"  [Warning] 学位论文抓取失败：{e}")
+    if USE_CN_JOURNALS:
+        try:
+            import sources as _src
+            all_papers.extend(_src.fetch_openalex_journals(days=CN_JOURNAL_DAYS))
+        except Exception as e:
+            print(f"  [Warning] 中文核心刊抓取失败：{e}")
+
     try:
         import sources as _src
         return _src.dedupe_by_title(all_papers)
@@ -1377,6 +1418,34 @@ def main():
                 ['all:"preferential flow"', 'all:"slope stability"'], 60))
         except Exception as e:
             print(f"  [警告] arXiv 抓取失败：{e}")
+
+    # A4: ★ 学位论文（2026-10-01 新增）
+    if USE_DISSERTATIONS:
+        try:
+            import sources as _src
+            print("\n" + "=" * 60)
+            print("【学位论文源】OpenAlex type:dissertation")
+            print("=" * 60)
+            ds = _src.fetch_openalex_dissertations(
+                DISSERTATION_QUERIES, days=DISSERTATION_DAYS,
+                per_query=DISSERTATIONS_PER_QUERY)
+            all_papers.extend(ds)
+            print(f"  [学位论文] 合计 {len(ds)} 篇")
+        except Exception as e:
+            print(f"  [警告] 学位论文抓取失败：{type(e).__name__}: {e}")
+
+    # A5: ★ 中文核心刊（2026-10-01 新增，只能到题目级别）
+    if USE_CN_JOURNALS:
+        try:
+            import sources as _src
+            print("\n" + "=" * 60)
+            print("【中文核心刊源】OpenAlex 按 ISSN（Crossref 几乎没有）")
+            print("=" * 60)
+            cj = _src.fetch_openalex_journals(days=CN_JOURNAL_DAYS)
+            all_papers.extend(cj)
+            print(f"  [中文核心刊] 合计 {len(cj)} 篇")
+        except Exception as e:
+            print(f"  [警告] 中文核心刊抓取失败：{type(e).__name__}: {e}")
 
     # ★ 2026-10-01：把云端（GitHub Actions）在笔记本睡着时攒下的候选合并进来。
     #   放在"无数据就退出"之前——万一本地网络抽风抓不到，云端攒的还是能兜住。

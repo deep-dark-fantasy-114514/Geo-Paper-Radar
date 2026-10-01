@@ -47,6 +47,21 @@ UA = ("GeoPaperRadar/3.1 (academic literature radar; "
       "mailto:%s)" % MAILTO)
 HEADERS = {"User-Agent": UA, "Accept": "application/json"}
 
+# ★★★ 2026-10-01：OpenAlex 从 2026-02-13 起【强制要求 API key】，
+# `mailto` 礼貌池已废弃且被忽略。匿名访问只有 $0.10/天（同 IP 所有人共享），
+# 实测已被耗尽 —— 6 组查询全返回 429，OpenAlex 覆盖【全丢】。
+# 免费 key 给 $1/天（10 万 credits），我们每次跑约 150 credits，占用 0.3%。
+#   申请：https://openalex.org 注册 → https://openalex.org/settings/api 复制
+#   填法：.env 里加一行  OPENALEX_API_KEY=<你的key>
+OPENALEX_KEY = os.getenv("OPENALEX_API_KEY", "").strip()
+
+
+def _auth_headers(url):
+    """OpenAlex 需要 Authorization 头；其它源不需要。"""
+    if OPENALEX_KEY and "api.openalex.org" in url:
+        return {"Authorization": "Bearer " + OPENALEX_KEY}
+    return {}
+
 # 与 paper_radar.CHINESE_JOURNALS_ISSN 保持一致
 CHINESE_ISSN = {"1000-6915", "1000-4548", "1000-2383"}
 
@@ -85,15 +100,26 @@ def polite_get(url, params=None, timeout=45, retries=4, base_delay=1.5,
     for attempt in range(1, retries + 1):
         try:
             _last_call[0] = time.time()
-            r = _session.get(url, params=params, timeout=timeout)
+            r = _session.get(url, params=params, timeout=timeout,
+                             headers=_auth_headers(url))
             if r.status_code in (429, 500, 502, 503, 504):
-                wait = delay
+                # ★ OpenAlex 的 429 里 retryAfter 可能长达数万秒（等下一天）——
+                #   那种情况重试没意义，直接放弃并说明原因，别把整批拖死。
                 ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait = max(wait, float(ra))
-                    except ValueError:
-                        pass
+                try:
+                    ra_s = float(ra) if ra else 0
+                except ValueError:
+                    ra_s = 0
+                if r.status_code == 429 and ra_s > 300:
+                    key_hint = ("" if OPENALEX_KEY else
+                                "  ⇒ 需在 .env 里填 OPENALEX_API_KEY"
+                                "（https://openalex.org/settings/api）")
+                    print(f"    [配额耗尽] 需等 {ra_s/3600:.1f} 小时重置"
+                          f"（{url.split('/')[2]}）{key_hint}")
+                    return None
+                wait = delay
+                if ra_s:
+                    wait = max(wait, ra_s)
                 if attempt < retries:
                     print(f"    [限流] HTTP {r.status_code}，{wait:.0f}s 后重试"
                           f"（{attempt}/{retries}）")
@@ -238,6 +264,110 @@ def fetch_crossref_journals(journals=None, days=7, rows=200):
         print(f"    取到 {len(got)} 篇")
         out.extend(got)
     return out
+
+
+# ══════════════════════════════════════════════
+# 3b. OpenAlex 学位论文（硕博）★ 2026-10-01 新增
+# ══════════════════════════════════════════════
+def _oa_to_paper(w):
+    """OpenAlex work → 统一格式（与 paper_radar._parse_work 一致的字段）。"""
+    title = w.get("title")
+    if not title:
+        return None
+    pl = w.get("primary_location") or {}
+    src = ((pl.get("source") or {}).get("display_name") or
+           w.get("type") or "OpenAlex")
+    inv = w.get("abstract_inverted_index")
+    ab = ""
+    if inv:
+        pos = {}
+        for word, idxs in inv.items():
+            for i in idxs:
+                pos[i] = word
+        ab = " ".join(pos[k] for k in sorted(pos))
+    best = w.get("best_oa_location") or {}
+    oa = w.get("open_access") or {}
+    pdf = (best.get("pdf_url") or oa.get("oa_url") or "").strip()
+    doi = w.get("doi") or ""
+    auth = [((a.get("author") or {}).get("display_name") or "")
+            for a in (w.get("authorships") or [])][:10]
+    return pack(title=title, link=doi or w.get("id") or "", summary=ab,
+                source=src, data_source="OpenAlex",
+                doi=doi, authors=[a for a in auth if a],
+                year=w.get("publication_year"),
+                issn=(((pl.get("source") or {}).get("issn")) or []),
+                oa_pdf_url=pdf, is_oa=bool(oa.get("is_oa") or pdf))
+
+
+def fetch_openalex_dissertations(queries, days=365, per_query=60, max_total=200):
+    """学位论文（type:dissertation）。
+
+    实测：`landslide rainfall` 近 3 年 497 篇、`preferential flow soil` 1,153 篇，
+    **绝大多数带摘要**。相关性匹配较松（会混进化学/医学的），
+    但本地打分免费 ⇒ 交给模型筛，不在这里卡。
+    中文硕博在 OpenAlex 几乎为空（滑坡关键词只有 3 篇），CNKI 无公开 API。
+    """
+    from datetime import datetime, timedelta
+    frm = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    out = []
+    for i, q in enumerate(queries, 1):
+        print(f"  [学位论文] {i}/{len(queries)}: {q!r}")
+        d = polite_get("https://api.openalex.org/works",
+                       params={"search": q,
+                               "filter": f"type:dissertation,"
+                                         f"from_publication_date:{frm}",
+                               "per-page": min(per_query, 200),
+                               "sort": "publication_date:desc",
+                               "mailto": MAILTO}, min_gap=1.0)
+        got = [p for p in (_oa_to_paper(w)
+                           for w in ((d or {}).get("results") or [])) if p]
+        ab = sum(1 for p in got if p["summary"] != "No abstract available")
+        print(f"    取到 {len(got)} 篇（有摘要 {ab}）")
+        out.extend(got)
+        if len(out) >= max_total:
+            break
+    return out[:max_total]
+
+
+# ══════════════════════════════════════════════
+# 3c. OpenAlex 按 ISSN 取【中文核心刊】★ 2026-10-01 新增
+# ══════════════════════════════════════════════
+# 实测（这是唯一能拿到中文核心刊的路子）：
+#   岩土工程学报 1000-4548      OpenAlex 3,258 篇 / Crossref 仅 2 篇
+#   岩石力学与工程学报 1000-6915 OpenAlex 5,209 篇 / Crossref 445 篇
+#   地球科学 1000-2383          OpenAlex 4,964 篇 / Crossref 3,872 篇
+# ⚠️ 两个已知限制：
+#   1. OpenAlex 的 language 字段不可靠（中文刊常标成 en）⇒ 别用 language 过滤，用 issn
+#   2. 近期收录有滞后（岩石力学与工程学报近半年 80 篇，岩土工程学报近半年 0 篇），
+#      且**无摘要**、标题是英译 ⇒ 只能到"题目级别"，靠本地模型看标题判断
+CN_JOURNAL_ISSN = {
+    "岩土工程学报": "1000-4548",
+    "岩石力学与工程学报": "1000-6915",
+    "地球科学": "1000-2383",
+}
+
+
+def fetch_openalex_journals(issns=None, days=90, per_journal=60, max_total=200):
+    """按 ISSN 取特定期刊的最新文献（中文核心刊就靠这条路）。"""
+    from datetime import datetime, timedelta
+    issns = issns or CN_JOURNAL_ISSN
+    frm = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    out = []
+    for name, issn in issns.items():
+        print(f"  [OpenAlex/期刊] {name} ({issn})")
+        d = polite_get("https://api.openalex.org/works",
+                       params={"filter": f"primary_location.source.issn:{issn},"
+                                         f"from_publication_date:{frm}",
+                               "per-page": min(per_journal, 200),
+                               "sort": "publication_date:desc",
+                               "mailto": MAILTO}, min_gap=1.0)
+        got = [p for p in (_oa_to_paper(w)
+                           for w in ((d or {}).get("results") or [])) if p]
+        print(f"    取到 {len(got)} 篇")
+        out.extend(got)
+        if len(out) >= max_total:
+            break
+    return out[:max_total]
 
 
 # ══════════════════════════════════════════════

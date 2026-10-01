@@ -43,6 +43,12 @@ jobs:
       - name: 抓取候选（不打分、不发邮件）
         env:
           PAPER_RADAR_MODE: harvest
+          # ★ 2026-10-01：OpenAlex 从 2026-02-13 起强制要求 API key
+          #（mailto 礼貌池已废弃）。没有 key 时 6 组查询会全部 429，
+          #  OpenAlex 覆盖全丢 —— 而它是主力源。
+          # 需要在仓库 Settings → Secrets and variables → Actions 里
+          # 新建一个叫 OPENALEX_API_KEY 的 secret。
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
         run: python paper_radar.py
 
       - name: 清理过期候选（保留 14 天，控制仓库体积）
