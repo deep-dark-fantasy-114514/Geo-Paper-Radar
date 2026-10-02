@@ -46,6 +46,11 @@ SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com")
 # 空串容错：.env 模板里常见 SMTP_PORT=（空）⇒ int("") 会在【导入阶段】直接崩
 _smtp_port = os.getenv("SMTP_PORT", "").strip()
 SMTP_PORT = int(_smtp_port) if _smtp_port.isdigit() else 465
+# ★ 2026-10-02：SMTP 安全模式显式化。留空 = 按老规则（465→ssl，其余→starttls）。
+#   可选："ssl" | "starttls" | "plain"
+#   端口号并不定义协议（25/2525/自定义端口都可能是三者之一），换邮箱服务时
+#   靠端口猜很容易直接发不出去。
+SMTP_SECURITY = os.getenv("SMTP_SECURITY", "").strip().lower()
 SMTP_SENDER = os.getenv("SMTP_SENDER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_RECEIVER = os.getenv("SMTP_RECEIVER", "")

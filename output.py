@@ -4,20 +4,84 @@
 
 从 paper_radar.py 拆出（2026-10-01，逐字搬运，未改逻辑）。
 """
+import hashlib
 import html as _html
 import os
 import re
 import smtplib
+import tempfile
 import traceback
 import urllib.parse
 from datetime import datetime
+# ★ 2026-10-02：显式导入邮件构造相关的名字。
+#   原来它们全靠 `from config import *` 带进来 —— 而 `msg = MIMEMultipart(...)`
+#   发生在 try 之外，config 一旦不再导出这些名字就是**接不住的 NameError**。
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 from config import *
 
 
-def generate_ris_file(paper):
-    os.makedirs(ENDNOTE_WATCH_DIR, exist_ok=True)
+def _ris_text(v):
+    """RIS 单值清洗：换行折成空格 + 去控制字符 + 限长。
+
+    ★ 2026-10-02：RIS 是**逐行 tag** 的格式（`AB  - 内容`）。原来直接把
+      summary / tldr / title 拼进去 —— 摘要里只要有换行，第二行就不带 tag 了。
+      不同 importer 对"裸行"的容忍度不一样，轻则丢内容、重则整条解析失败。
+    """
+    s = str(v or "")
+    s = "".join(ch for ch in s if ch >= " " or ch == "\t")   # 去不可见控制字符
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    return re.sub(r"\s{2,}", " ", s).strip()[:3000]
+
+
+def _safe_http_url(u):
+    """只放行 http/https 的 URL（用于邮件正文的链接）。
+
+    ★ 2026-10-02：HTML escape 只防"语法注入"，不防 `javascript:` / `data:`
+      这类**危险 scheme**。链接来自外部数据源（RSS/OpenAlex/Crossref/模型），
+      属于不可信输入。主流邮箱客户端会自己过滤，但边界就该是边界。
+    """
+    u = (u or "").strip()
     try:
+        _p = urllib.parse.urlparse(u)
+        if _p.scheme in ("http", "https") and _p.netloc:
+            return u
+    except Exception:
+        pass
+    return ""
+
+
+def _paper_rid(paper):
+    """RIS 文件名里的稳定身份（8 位十六进制）。
+
+    ★★ 2026-10-02【P0：文件名不是身份，会静默覆盖】★★
+      原来文件名是 `{日期}_{数据源前4字}_{分数}分_{标题前40字}.ris`，
+      **没有任何"论文身份"成分**，而最后 `os.replace()` 是**无条件覆盖**。
+      实测（两篇不同论文，同一天、同分、标题前 40 字相同）：
+          两篇 → 同一个文件名 → 目录里只剩 1 个文件，A 的 RIS 被静默覆盖。
+      雪上加霜的是 `ds[:4]` 把 OpenAlex / OpenAlex-Diss / OpenAlex-CN
+      **全压成 `Open`**，三条数据源连区分度都没了。
+
+      ⇒ 文件名尾部追加 paper_key 哈希（与 processed / history / 暂存区
+        用的是同一套身份：规范化 DOI 优先，其次规范化标题）。
+    """
+    k = ""
+    try:
+        import processed as _proc
+        k = _proc.key_of(paper) or ""
+    except Exception:
+        pass
+    if not k or k == "title:":
+        k = "ttl:" + norm_title(paper.get("title"))
+    return hashlib.sha256(k.encode("utf-8")).hexdigest()[:8]
+
+
+def generate_ris_file(paper):
+    try:
+        os.makedirs(ENDNOTE_WATCH_DIR, exist_ok=True)
         title = paper.get("title", "Untitled")
         score = paper.get("total_score", 0)
         tldr = paper.get("tldr", "")
@@ -43,39 +107,62 @@ def generate_ris_file(paper):
         for author in authors[:10]:
             if author:
                 ris_lines.append(f"AU  - {author}")
-        _yr = paper.get("year") or datetime.now().year
-        ris_lines.append(f"PY  - {_yr}//")
-        ris_lines.append(f"JO  - {source}")
+        # ★ 2026-10-02：年份【取不到就不写 PY】，不再拿当前年冒充。
+        #   原来 `year or datetime.now().year` ⇒ 年份缺失的文献被写成今年，
+        #   那是一个"看起来完全合理但其实是错的"值，比留空更难发现。
+        _yr = paper.get("year")
+        try:
+            _yr = int(_yr) if _yr else None
+        except (TypeError, ValueError):
+            _yr = None
+        if _yr:
+            ris_lines.append(f"PY  - {_yr}//")
+        ris_lines.append(f"JO  - {_ris_text(source)}")
         if link:
-            ris_lines.append(f"UR  - {link}")
-        _doi = (paper.get("doi") or "").strip()
+            ris_lines.append(f"UR  - {_ris_text(link)}")
+        # ★ DOI 优先用现成字段，并用全仓唯一的 canonical_doi；
+        #   兜底才从 link 里扒，且用的是同一个实现（原来这里自己写了第三套正则）。
+        _doi = canonical_doi(paper.get("doi"))
         if not _doi:
-            _m = re.search(r'10\.\d{4,}/[\w\.\-]+', link or "")
-            _doi = _m.group(0) if _m else ""
+            _doi = canonical_doi(link)
         if _doi:
             ris_lines.append(f"DO  - {_doi}")
         if summary and not no_abstract(summary):   # ★ 统一判空（带 strip）
-            ris_lines.append("AB  - " + summary)
-        ris_lines.append(f"KW  - Geo_Paper_Radar_V3.0")
+            ris_lines.append("AB  - " + _ris_text(summary))
+        ris_lines.append("KW  - Geo_Paper_Radar_V3.0")
         ris_lines.append(f"KW  - Source:{ds}")
         ris_lines.append(f"KW  - Score:{score}/40")
         if tldr:
-            ris_lines.append("N1  - " + tldr)
+            ris_lines.append("N1  - " + _ris_text(tldr))
         ris_lines.append("ER  - ")
         ris_content = "\n".join(ris_lines) + "\n"
 
-        safe_title = safe_filename(title, 40)
+        safe_title = _ris_text(safe_filename(title, 40))
         date_str = datetime.now().strftime("%Y-%m-%d")
-        ds_tag = ds[:4]  # 数据源短标签
-        filename = f"{date_str}_{ds_tag}_{score}分_{safe_title}.ris"
+        # ★ 数据源标签原来取 `ds[:4]`，把 OpenAlex / OpenAlex-Diss / OpenAlex-CN
+        #   全压成 "Open"。改成把 - 后缀也带上（去掉连字符便于做文件名）。
+        ds_tag = re.sub(r"[^0-9A-Za-z]", "", ds)[:10] or "SRC"
+        filename = (f"{date_str}_{ds_tag}_{score}分_{safe_title}"
+                    f"_{_paper_rid(paper)}.ris")
         filepath = os.path.join(ENDNOTE_WATCH_DIR, filename)
-        # ★ 原子写（与 processed / save_history 一致，今天第 4 处补齐）
-        tmp = filepath + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(ris_content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, filepath)
+        # ★ 原子写（与 processed / save_history 一致）
+        #   临时名必须【自己唯一】：原来是 `filepath + ".tmp"`，
+        #   两个进程写同一篇就会用同一个临时文件互相踩。
+        fd, tmp = tempfile.mkstemp(prefix=".ris-", suffix=".tmp",
+                                   dir=ENDNOTE_WATCH_DIR)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(ris_content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, filepath)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise
         return filepath
     except Exception as e:
         print(f"  [Warning] 生成 .ris 失败: {e}")
@@ -90,7 +177,20 @@ def build_html_email_v3(papers):
     """V3.0 HTML 邮件（增加数据源标记）"""
     today = datetime.now().strftime("%Y-%m-%d")
     # 打分器名按配置动态显示（原来页脚写死 DeepSeek，默认却是本地 Qwen）
-    _scorer_label = ("本地 Qwen3.5-9B" if SCORER == "local" else "DeepSeek")
+    # ★ 2026-10-02：原来按【配置】的 SCORER 猜打分器名。而本地挂掉会静默
+    #   回退 DeepSeek ⇒ 邮件底部写着"本地 Qwen3.5-9B"、实际是 DeepSeek 打的。
+    #   改读 scoring.LAST_RUN（它记的是【实际】跑了哪一个）。
+    _lr = {}
+    try:
+        import scoring as _scm
+        _lr = getattr(_scm, "LAST_RUN", {}) or {}
+    except Exception:
+        pass
+    _actual = _lr.get("scorer")
+    if _actual:
+        _scorer_label = _actual + ("（本地失败已回退）" if _lr.get("fallback") else "")
+    else:
+        _scorer_label = ("本地 Qwen3.5-9B" if SCORER == "local" else "DeepSeek")
     cards_html = ""
     for i, p in enumerate(papers, 1):
         ts = p.get("total_score", 0)
@@ -150,7 +250,7 @@ def build_html_email_v3(papers):
                 </div>
                 📌 <strong>推荐理由：</strong>{e(reason)}
             </div>
-            <div style="margin-top:10px;"><a href="{e(link)}" target="_blank" style="display:inline-block; background:#3498db; color:#fff; text-decoration:none; padding:8px 18px; border-radius:6px; font-size:14px;">🔗 阅读原文</a></div>
+            <div style="margin-top:10px;"><a href="{e(_safe_http_url(link))}" target="_blank" style="display:inline-block; background:#3498db; color:#fff; text-decoration:none; padding:8px 18px; border-radius:6px; font-size:14px;">🔗 阅读原文</a></div>
         </div>"""
 
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
@@ -164,7 +264,7 @@ def build_html_email_v3(papers):
     {cards_html}
     <div style="text-align:center; padding:20px; color:#95a5a6; font-size:13px; border-top:1px solid #e0e0e0; margin-top:10px;">
         <p style="margin:4px 0;">📡 多源检索 · 两阶段过滤：加权 Regex → {_scorer_label}</p>
-        <p style="margin:4px 0;">🤖 双轨制：总分≥30 或 创新分≥9</p>
+        <p style="margin:4px 0;">🤖 双轨制：总分≥{TOTAL_SCORE_PASS} 或 创新分≥{INNOVATION_PASS}（每维满分 10）</p>
         <p style="margin:4px 0;">📁 .ris 引文已同步存入 EndNote_Watch</p>
     </div>
 </div></body></html>"""
@@ -186,8 +286,16 @@ def send_email(html_content, attachments=None):
     # ★ 2026-10-01：补纯文本备用正文。
     #   原来只有 text/html，纯文本客户端看到空白，且会拉高反垃圾评分。
     #   结构改为 multipart/alternative 包 plain + html，再嵌进 mixed。
-    _plain = re.sub(r"<[^>]+>", " ", html_content)
-    _plain = _html.unescape(re.sub(r"\s+", " ", _plain)).strip()[:4000]
+    # ★ 2026-10-02：先把 <a href="X">文字</a> 转成 "文字：X"，再剥其余标签。
+    #   原来一刀切 `re.sub(r"<[^>]+>", " ")` —— 链接文字留下了、**URL 全没了**，
+    #   纯文本客户端只能看到"🔗 阅读原文"却没有地址。
+    _plain = re.sub(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                    lambda m: "%s：%s" % (_html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip(),
+                                          _html.unescape(m.group(1))),
+                    html_content, flags=re.S | re.I)
+    _plain = re.sub(r"<[^>]+>", " ", _plain)
+    _plain = _html.unescape(re.sub(r"[ \t]+", " ", _plain))
+    _plain = re.sub(r"\n\s*\n+", "\n", _plain).strip()[:4000]
     related = MIMEMultipart("related")
     alt = MIMEMultipart("alternative")
     alt.attach(MIMEText(_plain, "plain", "utf-8"))
@@ -223,15 +331,29 @@ def send_email(html_content, attachments=None):
         #   原来写死 SMTP_SSL ⇒ 只支持隐式 SSL（465）；换成 587（机构邮箱 /
         #   SendGrid / SES / Office365 常用的 STARTTLS）会直接
         #   SSLError: WRONG_VERSION_NUMBER，邮件彻底发不出。
-        if int(SMTP_PORT) == 465:
+        # ★ 2026-10-02：安全模式改为【显式配置】，不再只靠端口号猜。
+        #   端口号并不定义协议 —— 25 / 2525 / 自定义端口都可能是
+        #   plain / STARTTLS / SSL 中的任一种。换邮箱服务时按端口猜很容易直接发不出去。
+        #   不设 SMTP_SECURITY 时仍按老规则（465→ssl，其余→starttls）兜底。
+        _sec = (SMTP_SECURITY or "").strip().lower()
+        if not _sec:
+            _sec = "ssl" if int(SMTP_PORT) == 465 else "starttls"
+        if _sec == "ssl":
             with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
                 server.login(SMTP_SENDER, SMTP_PASSWORD)
                 server.sendmail(SMTP_SENDER, [SMTP_RECEIVER], msg.as_string())
         else:
             with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
                 server.ehlo()
-                server.starttls()
-                server.ehlo()
+                if _sec == "starttls":
+                    # ★ 先问服务器支不支持 —— 连接成功 ≠ 支持 STARTTLS。
+                    #   不支持时直接 starttls() 抛的错很难和"网络不通"区分开。
+                    if not server.has_extn("starttls"):
+                        raise smtplib.SMTPException(
+                            f"{SMTP_SERVER} 未声明支持 STARTTLS；"
+                            f"若该服务用隐式 SSL，请设 SMTP_SECURITY=ssl")
+                    server.starttls()
+                    server.ehlo()
                 server.login(SMTP_SENDER, SMTP_PASSWORD)
                 server.sendmail(SMTP_SENDER, [SMTP_RECEIVER], msg.as_string())
         print(f"  [成功] 邮件已发送至 {SMTP_RECEIVER}")
