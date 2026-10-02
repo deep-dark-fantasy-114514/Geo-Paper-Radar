@@ -21,6 +21,8 @@ import smtplib
 import traceback
 import re
 import shutil
+import tempfile
+import unicodedata
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -70,7 +72,11 @@ DEAD_RSS_BLACKLIST = [
 # ---- OpenAlex 配置 ----
 OPENALEX_BASE_URL = "https://api.openalex.org"
 OPENALEX_PER_PAGE = 200          # 每页最多 200
-OPENALEX_MAX_PAGES = 1           # 只取最近 1 页（200篇足够）
+# ★ 2026-10-02 删除 `OPENALEX_MAX_PAGES = 1` —— 它是**死配置**：
+#   `OpenAlexFetcher._build_search_url()` 只接受 `page=1`，从来没有人去翻
+#   第 2 页。留着会让"改成 5 就多抓 5 页"变成一个错误的期待。
+#   真要支持多页，得在 fetch_papers() 里写分页循环（目前设计是"每天取
+#   时间窗口内最新的一页"，够用）。
 OPENALEX_DAYS_LOOKBACK = 7       # 抓取过去 7 天
 
 # ---- DeepSeek 配置 ----
@@ -251,13 +257,25 @@ ASK_IMAGE = os.getenv(
                  "local-vision", "scripts", "ask_image.py"))
 
 SCORER = os.getenv("PAPER_RADAR_SCORER",
-                   "local" if LOCAL_MODE else "deepseek")   # local | deepseek
+                   "local" if LOCAL_MODE else "deepseek").strip().lower()
+# ★ 2026-10-02：枚举校验必须在这里做。
+#   scoring.py 的判据是 `if SCORER == "local": ... else: 走 DeepSeek` ——
+#   所以 `PAPER_RADAR_SCORER=loca` 这种手滑**不会报错**，只会静默走成
+#   DeepSeek ⇒ 你以为在用免费的本地模型，实际在按量计费。
+if SCORER not in ("local", "deepseek"):
+    raise SystemExit(
+        f"[配置错误] PAPER_RADAR_SCORER={SCORER!r} 不合法，只能是 'local' 或 "
+        f"'deepseek'。（不校验的话会静默走成 DeepSeek 并产生费用）")
 MAX_CANDIDATES = None         # ★ 2026-10-01：设为 None = **不设上限，粗筛通过的全部送打分**
                               #   本地打分免费（1.1 s/篇），实测 1049 篇约 19 分钟，可接受。
                               #   想恢复上限就写个数字（如 800）。
                               #   注意：只有本地打分(SCORER=local)时才不限；
                               #   DeepSeek 路径仍按 MAX_DEEPSEEK_INPUT=40 卡住防费用失控。
-COARSE_MIN_HITS = 1           # 粗筛命中阈值（只作用于【有摘要】的）
+# ★ 2026-10-02 删除 `COARSE_MIN_HITS = 1` —— 死配置：
+#   主流程调的是 `local_regex_coarse_filter(papers)`，**不传 min_hits**，
+#   于是走的是加权分规则（`COARSE_MIN_SCORE`）。这个变量只有"有人显式
+#   调用并传参"时才有意义，留着会让人误以为它控制着主流程。
+#   真正的粗筛阈值是上面那条 `COARSE_MIN_SCORE`。
 COARSE_NO_ABSTRACT_BYPASS = True   # ★ 无摘要的（多是闭源）不卡关键词，全放行
                                    #   让本地模型看标题判 —— 实测能救回 440 篇被误杀的
                                    #   代价：多约 8 分钟打分（免费）
@@ -367,8 +385,9 @@ REPO_RAW_MIRRORS = [u.strip() for u in os.getenv(
               "https://ghproxy.net/" + _GH_RAW,       # 实测 1.1 s
               _GH_RAW])).split(",") if u.strip()]     # 直连（需代理）
 
-# 兼容旧名：仍指向【首选】地址
-REPO_RAW = REPO_RAW_MIRRORS[0]
+# ★ 2026-10-02 删除 `REPO_RAW = REPO_RAW_MIRRORS[0]`（兼容旧名用的别名）——
+#   全仓没有任何地方再读它，留着只会在配置审计里显示成一个"死配置"。
+#   现在读云端候选一律走 REPO_RAW_MIRRORS。
 
 # ---- 杂项 ----
 FETCH_HOURS = 24         # RSS 抓取窗口（小时）
@@ -391,14 +410,36 @@ def get_chrome_headers():
 
 
 def load_history():
+    """读"已推送过"的键集合。
+
+    ★★ 2026-10-02【损坏 ≠ 空】★★
+      原来把 JSONDecodeError 也当成"没有历史"，直接 `return set()`。
+      后果不是"少一次去重"，而是：**历史全丢 ⇒ 已推送过的论文全部重新入池
+      ⇒ 重复推送 + 重复打分 + 重复下载**。
+      这跟 `_load_existing_csv` 那个坑是同一类（"我读不到"被当成"它不存在"）。
+      ⇒ 现在：损坏就把原件改名 `.corrupt-<时间戳>` 留档，并【中止】本次运行，
+        让人工决定怎么恢复 —— 宁可当天不推送，也不要给你发一箱旧文献。
+    """
     if not os.path.exists(HISTORY_FILE):
         return set()
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("顶层不是 dict")
         return set(data.get("pushed", []))
-    except (json.JSONDecodeError, FileNotFoundError):
-        return set()
+    except Exception as e:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        salvaged = HISTORY_FILE + ".corrupt-" + stamp
+        try:
+            shutil.move(HISTORY_FILE, salvaged)
+            print(f"[!! 历史记录损坏] {type(e).__name__}: {e}")
+            print(f"    原文件已留档：{salvaged}")
+            print(f"    为避免【把已推送过的文献重新推一遍】，本次运行中止。")
+            print(f"    确认后用文件名改回 {HISTORY_FILE} 再跑。")
+        except Exception as e2:
+            print(f"[!! 历史记录损坏且留档失败] {type(e).__name__}: {e} / {e2}")
+        raise SystemExit(2)
 
 
 def save_history(links):
@@ -429,16 +470,63 @@ def save_history(links):
 
 
 def make_link_key(entry):
+    """"已推送过"的键。**全项目唯一实现**（paper_radar 的历史去重、补发去重都走它）。
+
+    ★★ 2026-10-02【身份必须稳定】★★
+      原来直接 `return link` —— 于是同一篇论文只要来源不同就变成两把键：
+          `https://doi.org/10.1016/j.enggeo.2026.107001`   （DOI URL）
+          `https://www.sciencedirect.com/science/article/...`（落地页）
+      ⇒ 历史去重失效 → 有可能重复推送。
+      标题兜底原来也是 `md5(title)`，**没走 norm_title** ⇒ `Rainfall  infiltration`
+      和 `Rainfall infiltration.` 算出两个不同的键。
+
+      ⇒ 现在的优先级（与 `processed.key_of` 同一套身份）：
+          ① 规范化 DOI  →  `doi:10.xxxx/yyy`
+          ② link / id 是 http URL → 原样（arXiv、落地页等没有 DOI 的）
+          ③ 规范化标题  →  `title:<norm_title 截 120>`
+
+    ⚠️ 规则变了，`history.json` 里的旧键必须**迁移**（见 migrate_history_keys），
+      否则那 65 条会被当成本轮新文献重新推送。
+    """
     if isinstance(entry, dict):
-        link = entry.get("link", "").strip()
-        if link:
-            return link
-        entry_id = entry.get("id", "") or entry.get("guid", "") or ""
-        if entry_id.startswith("http"):
-            return entry_id
-        title = entry.get("title", "")
-        return hashlib.md5(title.encode("utf-8")).hexdigest()
-    return str(entry)
+        for k in ("doi", "link", "id", "guid"):
+            d = canonical_doi(entry.get(k) or "")
+            if d:
+                return "doi:" + d.lower()
+        for k in ("link", "id", "guid"):
+            v = (entry.get(k) or "").strip()
+            if v.startswith("http"):
+                return v
+        t = norm_title(entry.get("title"))
+        if t:
+            return "title:" + t[:120]
+        return ""
+    # 字符串入参（history.json 里的旧键）
+    d = canonical_doi(str(entry))
+    return ("doi:" + d.lower()) if d else str(entry)
+
+
+def migrate_history_keys(path=None, dry=False):
+    """把 history.json 里的旧键（裸 URL）迁移到新规则。
+
+    只需跑一次。可安全重复运行（新键再迁移结果不变）。
+    """
+    path = path or HISTORY_FILE
+    if not os.path.exists(path):
+        return 0, 0
+    with open(path, "r", encoding="utf-8") as f:
+        old = set(json.load(f).get("pushed", []))
+    new = {make_link_key(k) for k in old}
+    new.discard("")
+    changed = len(old - new) if old != new else 0
+    if not dry and new != old:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"pushed": sorted(new)}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    return len(old), len(new)
 
 
 def is_within_hours(entry, hours=24):
@@ -447,7 +535,13 @@ def is_within_hours(entry, hours=24):
         return True
     pub_time = datetime(*published[:6], tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
-    return (now - pub_time) <= timedelta(hours=hours)
+    # ★ 2026-10-02：必须排除【未来时间】。原来只有上界 `(now - pub) <= hours`，
+    #   而未来时间的差是负数，一定 <= hours ⇒ **"明天发表"的文章会被当成
+    #   "过去 24 小时内"**。数据源里由于时区/online-first/issue date 混乱，
+    #   未来日期并不罕见。
+    #   下界留 6 小时容忍时钟偏移与各源时区差（不做成 0）。
+    age = now - pub_time
+    return timedelta(hours=-6) <= age <= timedelta(hours=hours)
 
 
 # Windows 保留设备名（这些名字做文件名会被系统拒绝）
@@ -462,12 +556,24 @@ def safe_filename(text, max_len=40):
     ★ 2026-10-01 补两处 Windows 边界：
       · **末尾的点和空格**：Windows 会静默吃掉，导致实际文件名与预期不符
       · **保留设备名**（CON/PRN/AUX/NUL/COM1…）：系统直接拒绝创建
+
+    ★ 2026-10-02 再补两处（审查第 23/24 条）：
+      · **保留名要连扩展名一起判**。原来只比 `safe.upper()` 整串，
+        所以 `CON.pdf` / `AUX.pdf` / `NUL.txt` **照样能过** —— 而它们在
+        Windows 上同样创建失败。现在取 stem 再比。
+      · **不可见字符要清掉**：零宽空格（U+200B）、软连字符、制表符等
+        会让"看起来一样"的两个文件名实际不同 —— 而这里的输入有相当一部分
+        来自大模型生成的中文名。先做 NFKC + 去控制/格式类字符。
     """
-    safe = re.sub(r'[\\/*?:"<>|]', "", text)
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    # 去掉所有"控制类/格式类"字符（零宽空格、软连字符、制表符…）
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+    safe = re.sub(r'[\\/*?:"<>|]', "", s)
     if len(safe) > max_len:
         safe = safe[:max_len]
     safe = safe.strip().rstrip(". ")          # 末尾的点/空格会被 Windows 吃掉
-    if safe.upper() in _WIN_RESERVED:         # 撞保留名 ⇒ 加前缀
+    stem = os.path.splitext(safe)[0].upper()  # ★ 连扩展名一起判保留名
+    if stem in _WIN_RESERVED:
         safe = "_" + safe
     return safe
 
@@ -515,24 +621,37 @@ def no_abstract(p_or_summary):
     return (not s) or s.startswith("No abstract")
 
 
+_SEP_RE = re.compile(r"[‐-―−­\-_/\\&+＋·・]+")
+
+
 def norm_title(title):
-    """标题归一化：**剥离 XML 标签 → 压空白 → 去标点 → 转小写**。
+    """标题规范化 —— 全仓唯一的"论文身份"清洗（processed.key_of / sources
+    跨源去重 / manual_ingest 清单索引 / history 都走它）。
 
-    ★ 2026-10-01：这是全仓唯一实现。原来三处各写一份，已经漂了 ——
-      `manual_ingest._norm_title` 漏掉"剥标签"这一步，而 `sources._norm_title_key`
-      和 `processed.key_of` 有。三份算出三把键，跨清单匹配就可能对不上。
+    ★ 2026-10-02 修两个真问题（此前这段只做"剥标签 + 删标点"）：
 
-    ⚠️ 处理顺序很关键：**必须先剥标签再删标点**。反过来会把标签里的字母留下 ——
-      实测 `<i>Preferential flow</i> in slopes` 会被规范化成
-      `ipreferential flowi in slopes`，从而漏判重复。
+    ① **连接符被"删掉"而不是"换成空格"** ⇒ 同一篇论文算成两个身份。
+       实测：`Rainfall–infiltration in slopes` → `rainfallinfiltration in slopes`，
+       而 `Rainfall infiltration in slopes` → `rainfall infiltration in slopes`。
+       两者不相等 ⇒ **跨源去重失效、历史去重失效**。
+       而 filters.py 里的关键词匹配早就做了 dash→空格，唯独"身份"这一份没做。
 
-    调用方：`processed.key_of` / `sources._norm_title_key` / `manual_ingest`。
+    ② **非 ASCII 字母被整体删掉** ⇒ 不同论文算成同一身份（假合并）。
+       实测：`μCT-based ...` 和 `CT-based ...` 都变成 `ctbased ...`；
+       更糟的是 `β-slope stability` → `slope stability`，与真正的
+       `slope stability` 撞车。
+       ⇒ 改用 NFKC 归一 + 保留任何语言的字母数字（`\\w` 在 Python3 是 Unicode 感知的），
+         只删结构性标点。
+
+    顺序仍然关键：**先剥标签再处理标点**（反向会留下标签里的字母）。
     """
-    t = (title or "").strip().lower()
-    t = re.sub(r"<[^>]+>", " ", t)            # 先剥标签（否则字母残留）
-    t = re.sub(r"\s+", " ", t)                # 压空白
-    t = re.sub(r"[^0-9a-z一-鿿 ]", "", t)     # 去标点
-    return t.strip()
+    t = unicodedata.normalize("NFKC", str(title or ""))
+    t = t.lower()
+    t = re.sub(r"<[^>]+>", " ", t)          # 先剥标签（否则字母残留）
+    t = _SEP_RE.sub(" ", t)                 # 连接符/分隔符 → 空格（不是删掉）
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s]", "", t, flags=re.UNICODE)   # 只删结构性标点，保留 μ/β/é/中文…
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def unique_path(path):
@@ -562,12 +681,16 @@ def atomic_copy_into(src, dst_dir, name=None):
     """
     os.makedirs(dst_dir, exist_ok=True)
     target = unique_path(os.path.join(dst_dir, name or os.path.basename(src)))
-    tmp = target + ".tmp"
+    # ★ 2026-10-02：临时名必须**自己唯一**。原来是 `target + ".tmp"` ——
+    #   两个进程若算出同一个 target，就会用同一个临时文件互相踩。
+    #   （`unique_path` 本身也有 check-then-create 窗口，见它自己的注释。）
+    fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".copy-", suffix=".tmp")
     try:
-        with open(src, "rb") as fi, open(tmp, "wb") as fo:
-            shutil.copyfileobj(fi, fo, 1024 * 256)
-            fo.flush()
-            os.fsync(fo.fileno())
+        with open(src, "rb") as fi:
+            with os.fdopen(fd, "wb") as fo:      # mkstemp 已建好，用它给的 fd
+                shutil.copyfileobj(fi, fo, 1024 * 256)
+                fo.flush()
+                os.fsync(fo.fileno())
         os.replace(tmp, target)          # 原子换名：EndNote 只会看到完整文件
     except Exception:
         try:
@@ -592,3 +715,87 @@ def infer_journal_name(url):
         return "未知期刊"
 
 
+
+
+# ══════════════════════════════════════════════
+# ★ 2026-10-02 新增：启动期配置自检
+# ══════════════════════════════════════════════
+# 为什么需要：这些参数直接决定业务状态（发几篇邮件、下几篇 PDF、花不花钱），
+# 但原来它们**只有定义、没有任何合法性检查**。手滑写个
+# `TOTAL_SCORE_PASS=0` 或 `BROWSING_THRESHOLD=32`，程序不会报错，
+# 只会静默地做出你没想要的选择。
+#
+# 调用方：paper_radar.main() 开头（harvest 模式不校验 —— 它不碰这些）。
+def validate_config(verbose=True):
+    """检查配置的取值与相互矛盾。返回问题列表（空 = 通过）。"""
+    problems = []
+
+    def _rng(name, lo, hi):
+        v = globals().get(name)
+        if not isinstance(v, int) or isinstance(v, bool):
+            problems.append(f"{name} 必须是整数，当前 {v!r}")
+        elif not (lo <= v <= hi):
+            problems.append(f"{name}={v} 超出范围 [{lo}, {hi}]")
+
+    def _min(name, lo):
+        v = globals().get(name)
+        if not isinstance(v, int) or isinstance(v, bool):
+            problems.append(f"{name} 必须是整数，当前 {v!r}")
+        elif v < lo:
+            problems.append(f"{name}={v} 应 ≥ {lo}")
+
+    # 打分与筛选（四维各 0-10，总分 0-40）
+    _rng("TOTAL_SCORE_PASS",   0, 40)
+    _rng("INNOVATION_PASS",    0, 10)
+    _rng("BROWSING_THRESHOLD", 0, 40)
+    _min("MAX_EMAIL_RESULTS",  0)
+    _min("EMAIL_RESERVE_TRACK_B", 0)
+    _min("MAX_BROWSING_RESULTS", 0)
+    _min("MAX_DEEPSEEK_INPUT", 1)
+    _rng("COARSE_MIN_SCORE",   0, 1000)
+    _min("MAX_CANDIDATES", 0) if isinstance(globals().get("MAX_CANDIDATES"), int) else None
+
+    # 下载
+    _min("PDF_MAX_PER_RUN", 1)
+    _min("PDF_MAX_MB", 1)
+    _min("PDF_MIN_BYTES", 0)
+    _min("PDF_RETRIES", 0)
+    _min("PDF_RETRY_WAIT", 0)
+    _min("PDF_STAGE_KEEP_DAYS", 0)
+    _min("HARVEST_MAX", 1)
+    _min("HARVEST_MIN_PER_SOURCE", 0)
+    _min("HARVEST_ABSTRACT_CHARS", 100)
+    _rng("SMTP_PORT", 1, 65535)
+    _min("DEEPSEEK_TIMEOUT", 1)
+
+    # ── 相互矛盾 ──
+    b, t = globals().get("BROWSING_THRESHOLD"), globals().get("TOTAL_SCORE_PASS")
+    if isinstance(b, int) and isinstance(t, int) and b > t:
+        problems.append(
+            f"BROWSING_THRESHOLD({b}) > TOTAL_SCORE_PASS({t}) —— "
+            f"泛读门槛比通关门槛还高，泛读档永远为空")
+    ee, bb = globals().get("EMAIL_RESERVE_TRACK_B"), globals().get("MAX_EMAIL_RESULTS")
+    if isinstance(ee, int) and isinstance(bb, int) and bb and ee > bb:
+        problems.append(
+            f"EMAIL_RESERVE_TRACK_B({ee}) > MAX_EMAIL_RESULTS({bb}) —— "
+            f"给轨道B 留的席位比邮件总席位还多")
+    mw, mr = globals().get("MAX_BROWSING_RESULTS"), globals().get("MAX_EMAIL_RESULTS")
+    if isinstance(mw, int) and isinstance(mr, int) and mw and mw < mr:
+        problems.append(
+            f"MAX_BROWSING_RESULTS({mw}) < MAX_EMAIL_RESULTS({mr}) —— "
+            f"泛读配额比邮件配额还小，通常不是有意的")
+    lo, hi = globals().get("PDF_MIN_BYTES"), globals().get("PDF_MAX_MB")
+    if isinstance(lo, int) and isinstance(hi, int) and lo > hi * 1024 * 1024:
+        problems.append(f"PDF_MIN_BYTES 比 PDF_MAX_MB 还大，不可能有文件通过")
+
+    if verbose:
+        if problems:
+            print("\n[配置自检] 发现 %d 个问题：" % len(problems))
+            for p in problems:
+                print("   ✗ " + p)
+        else:
+            print("[配置自检] 通过（%s 打分 / 通关≥%s / 泛读≥%s / 邮件%s篇）"
+                  % (globals().get("SCORER"), globals().get("TOTAL_SCORE_PASS"),
+                     globals().get("BROWSING_THRESHOLD"),
+                     globals().get("MAX_EMAIL_RESULTS")))
+    return problems

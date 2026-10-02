@@ -112,6 +112,13 @@ def main():
     if HARVEST_MODE:
         return run_harvest()
 
+    # ★ 2026-10-02：启动就自检配置。这些参数直接决定业务状态
+    #   （发几篇邮件、下几篇 PDF、花不花钱），但原来只有定义、没有校验。
+    _cfg_problems = validate_config()
+    if _cfg_problems:
+        print("\n[中止] 配置有问题，先修好再跑（上面列了具体哪几条）。")
+        return 2
+
     print("\n" + "🌟" * 30)
     print("  Geo_Paper_Radar V3.0 — 地学文献雷达启动")
     print("  数据源: RSS + OpenAlex  |  过滤: 两阶段  |  双轨制筛选")
