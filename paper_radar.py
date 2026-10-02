@@ -387,10 +387,15 @@ def main():
     #   降级方向取【保守】—— 筛不出来就当作"没有通关文献"，不发邮件，
     #   而不是乱发。同时记进 problems 让退出码非零。
     try:
-        pass_list, browsing_list = dual_track_filter(scored_only)
+        # ★ 2026-10-02：第三个返回值是【通关但超出邮件上限】的。
+        #   它们照常进简报 / 待下载清单 / .ris，只是不发邮件 ——
+        #   以前这一步是被 `pass_list[:MAX_EMAIL_RESULTS]` 直接抹掉的。
+        pass_list, browsing_list, overflow_list = dual_track_filter(scored_only)
     except Exception as e:
         _note(f"双轨制筛选失败，本轮不发邮件（避免误推）：{type(e).__name__}: {e}")
-        pass_list, browsing_list = [], []
+        pass_list, browsing_list, overflow_list = [], [], []
+    # 打通关+溢出+泛读 = 所有"值得进简报与待下载清单"的
+    digest_browse = overflow_list + browsing_list
 
     # ★ 2026-10-01：把打过分的一律登记（不管分高分低），下次不再重复打分
     try:
@@ -417,11 +422,13 @@ def main():
                 ds = p.get("data_source", "?")
                 print(f"  ✅ [{ds}] {os.path.basename(fp)}")
 
-    if browsing_list:
+    if digest_browse:
         print(f"\n{'=' * 60}")
-        print("【备选泛读列表】（正文只在终端列，但 .ris 附件【一并发送】——用户 2026-10-01 确认）")
+        print(f"【备选/溢出列表】共 {len(digest_browse)} 篇"
+              f"（其中通关但超邮件上限的 {len(overflow_list)} 篇）"
+              f"（正文只在终端列，但 .ris 附件【一并发送】）")
         print("=" * 60)
-        for idx, p in enumerate(browsing_list, 1):
+        for idx, p in enumerate(digest_browse, 1):
             ts = p.get("total_score", 0)
             mi = p.get("method_innovation", 0)
             ds = p.get("data_source", "?")
@@ -465,7 +472,7 @@ def main():
     # ★ 2026-10-01：下载是【可降级】环节 —— 它挂了不该连累简报和邮件。
     #   原来裸调用，一旦抛异常，后面 F2 待下载清单 / F 简报 / E 邮件【全都不执行】，
     #   用户当天什么都收不到。下载函数内部已经逐篇兜住，这里防的是它自己出问题。
-    _batch = _retry + pass_list + browsing_list
+    _batch = _retry + pass_list + digest_browse
     try:
         pdf_saved, filed_keys, deferred_keys = download_all_oa_pdfs(_batch)
     except Exception as e:
@@ -491,12 +498,12 @@ def main():
         import library_manager as _lm2
         _lm2.ensure_dirs()
         dl_csv, dl_n = _lm2.build_download_list(
-            pass_list + browsing_list + titleonly_list, _settled)
+            pass_list + digest_browse + titleonly_list, _settled)
         if dl_csv:
             # ★ 登记为 listed，避免同一篇明天又被列一次
             try:
                 import processed as _proc
-                for _p in (pass_list + browsing_list):
+                for _p in (pass_list + digest_browse):
                     if _proc.key_of(_p) not in _settled:
                         _proc.mark(_p, "listed")
                 _proc._save()
@@ -530,11 +537,12 @@ def main():
             _sc_name = (getattr(_scm, "LAST_RUN", {}) or {}).get("scorer")
         except Exception:
             pass
-        digest_path = _lm.build_digest(pass_list, browsing_list,
+        digest_path = _lm.build_digest(pass_list, digest_browse,
                                        len(scored_papers),
                                        time.time() - start_time,
                                        titleonly=titleonly_list,
-                                       scorer=_sc_name)
+                                       scorer=_sc_name,
+                                       overflow_n=len(overflow_list))
         print(f"\n📋 文献简报：{digest_path}")
     except Exception as e:
         print(f"\n[警告] 简报生成失败：{type(e).__name__}: {e}")
@@ -546,8 +554,8 @@ def main():
     if not pass_list:
         print("\n" + "=" * 60)
         print("【结果】今日无通关文献")
-        if browsing_list:
-            print(f"📖 有 {len(browsing_list)} 篇备选泛读已存 EndNote_Watch")
+        if digest_browse:
+            print(f"📖 有 {len(digest_browse)} 篇备选/溢出已存 EndNote_Watch")
         print("📭 未发送邮件。")
         print("=" * 60)
     else:
@@ -590,7 +598,7 @@ def main():
     print(f"📊 抓取 {total} 篇（{len(_by_src)} 个源）"
           f" → 粗筛 {len(coarse_papers)}"
           f" → 打分 {len(scored_only)}"
-          f" → 通关 {len(pass_list)} + 备选 {len(browsing_list)}"
+          f" → 通关 {len(pass_list)} + 溢出 {len(overflow_list)} + 备选 {len(browsing_list)}"
           + (f" + 只标题 {len(titleonly_list)}" if titleonly_list else ""))
     print(f"   （打分器：{'本地 Qwen3.5-9B' if SCORER == 'local' else 'DeepSeek'}；"
           f"{'免 token 成本' if SCORER == 'local' else '按量计费'}）")

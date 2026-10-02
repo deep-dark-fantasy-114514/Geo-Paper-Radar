@@ -50,7 +50,8 @@ except Exception:
 #                     以后改清洗规则漏掉一处就会"去重表说处理过、下载清单说没有"。
 #                     现在直接引用，只有一个真身。
 from config import (BASE_DIR, PDF_INBOX_DIR, MANUAL_DROP_DIR, RENAMER, ASK_IMAGE,
-                    atomic_copy_into, unique_path, safe_filename, canonical_doi)
+                    atomic_copy_into, unique_path, safe_filename, canonical_doi,
+                    TOTAL_SCORE_PASS, INNOVATION_PASS)
 from processed import key_of                      # noqa: F401 (对外仍以 lm.key_of 暴露)
 from config import no_abstract as has_no_abstract     # noqa: F401
 
@@ -227,10 +228,13 @@ def _check_date_str(date_str):
 
 
 def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None,
-                 titleonly=None, scorer=None):
+                 titleonly=None, scorer=None, overflow_n=0):
     """生成 Markdown 文献简报。返回文件路径。
 
     `scorer`：本轮【实际】用的打分器名（从 scoring.LAST_RUN 读），不传则写"模型打分"。
+    `overflow_n`：`browsing_list` 的**前 N 篇**其实是"已通关但超出邮件上限"的
+      （`paper_radar` 把 overflow 拼在 browsing 前面）⇒ 单独成节，
+      别把通关级文献标成"泛读"。
     """
     date_str = _check_date_str(date_str)
     os.makedirs(DIGEST_DIR, exist_ok=True)
@@ -296,10 +300,26 @@ def build_digest(pass_list, browsing_list, scored_total, elapsed, date_str=None,
                 L.append(f"- [开放获取页面]({p['oa_landing_url']})")
             L.append("")
 
-    if browsing_list:
+    # ★ 2026-10-02：分流。前 overflow_n 篇是"已通关但超出邮件上限"的 ——
+    #   它们跟邮件里那些是同一档，只是没挤进邮件，不该混在"泛读"里降格显示。
+    _n_ov = max(0, min(int(overflow_n or 0), len(browsing_list or [])))
+    overflow_part = (browsing_list or [])[:_n_ov]
+    browse_part = (browsing_list or [])[_n_ov:]
+
+    if overflow_part:
+        L.append(f"## ★ 已通关·未入邮件（{len(overflow_part)} 篇）\n")
+        L.append(f"判定与邮件里那批同档（轨道A 总分≥{TOTAL_SCORE_PASS} 或 "
+                 f"轨道B 创新≥{INNOVATION_PASS}），只是超出邮件条数上限"
+                 f"（`MAX_EMAIL_RESULTS`）。**已一并进入待下载清单与 .ris。**\n")
+        L.append(head)
+        for i, p in enumerate(overflow_part, 1):
+            L.append(row(p, i))
+        L.append("")
+
+    if browse_part:
         L.append("## 备选泛读\n")
         L.append(head)
-        for i, p in enumerate(browsing_list, 1):
+        for i, p in enumerate(browse_part, 1):
             L.append(row(p, i))
 
     # ★ 2026-10-01：只有标题的论文【不打分】，单独一节供人工判断
