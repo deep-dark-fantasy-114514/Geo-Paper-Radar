@@ -623,11 +623,21 @@ def main():
     #   拿配置当运行事实会让人误判成本（以为免费，实际烧了 API）。
     try:
         import scoring as _sc
-        _r = getattr(_sc, "LAST_RUN", None)
-        if _r:
-            print(f"   实际使用: {_r['scorer']}"
-                  + ("（★ 已回退 DeepSeek，本批【按量计费】）"
-                     if _r.get("fallback") else "（无回退）"))
+        _r = getattr(_sc, "LAST_RUN", None) or {}
+        if _r.get("scorer"):
+            # ★ 2026-10-02 修：原来「整批回退」和「部分补送」共用一个
+            #   fallback 布尔，于是"只补了 40 篇"会被打印成
+            #   "本批【按量计费】"，和上一行"本地 Qwen（免费）"自相矛盾。
+            _mode = _r.get("fallback_mode")
+            if _mode == "full":
+                _tail = "（★ 本地不可用，整批回退 DeepSeek，本批【按量计费】）"
+            elif _mode == "partial":
+                _tail = (f"（本地 {_r.get('local_n', 0)} 篇免费 + "
+                         f"DeepSeek 补打 {_r.get('fallback_n', 0)} 篇"
+                         f"，后者【按量计费】）")
+            else:
+                _tail = "（全程本地，零 token 成本）"
+            print(f"   实际使用: {_r['scorer']}{_tail}")
     except Exception:
         pass
     print(f"{'=' * 60}")

@@ -128,6 +128,18 @@ def build_prompt(title, abstract):
         f"- 与本方向完全无关的（如纯遥感反演、纯岩石力学、纯管网水力学）都给 0-2 分\n\n"
         f"【论文标题】{title}\n"
         f"【摘要】{abstract[:2000]}\n\n"
+        # ★★ 2026-10-02【实测根因】★★
+        #   首次完整运行 74/895 篇失败，逐篇记录后发现 **100% 是
+        #   "缺字段 method_innovation"**，且只在有摘要路径出现。
+        #   抓模型原始输出才看清：**判定"完全无关"（前三维全 0）时，
+        #   它会跳过第 4 个维度直接去写 reason**：
+        #       {"slope_stability":0,"rainfall_infiltration":0,
+        #        "preferential_flow":0,"reason":"完全无关…",...}
+        #   而三次重试输出一模一样 ⇒ 确定性失败 ⇒ 次日重试仍然失败 ⇒
+        #   **失败文献天天累积、每天的打分量越来越大**。
+        #   ⇒ 一句显式要求把它堵在源头。
+        f"⚠️ 无论论文相关与否，**都必须输出完整的四个维度**，一个都不能省略、不能跳过；\n"
+        f"   完全不相关就把四个都写成 0（0,0,0,0），**不要只写前三个**。\n\n"
         f"只输出 JSON，不要解释、不要 markdown 代码块：\n"
         '{"slope_stability":<int>,"rainfall_infiltration":<int>,'
         '"preferential_flow":<int>,"method_innovation":<int>,'
@@ -201,14 +213,28 @@ def normalize(raw):
     if not isinstance(raw, dict):
         return None
     out = {}
+    # ★ 2026-10-02 兜底：模型在"判定完全无关"时会漏掉最后一个维度（见 build_prompt
+    #   里的根因说明）。若【已有的维度全为 0】而只缺个别维度，按 0 补 ——
+    #   模型写出三个 0 就已经表明它的意图了。
+    #   ⚠️ 只在这个条件下补：若已有维度里有非 0 值，仍按失败处理（宁可交上去补打，
+    #      也不要凭空编一个分数）。
+    _present, _missing = {}, []
     for k, _ in DIMS:
         v = raw.get(k)
         if v is None:
-            return None
+            _missing.append(k)
+            continue
         try:
-            out[k] = max(0, min(10, int(float(v))))
+            _present[k] = max(0, min(10, int(float(v))))
         except (TypeError, ValueError):
             return None
+    if _missing:
+        if _present and all(x == 0 for x in _present.values()):
+            for k in _missing:
+                _present[k] = 0
+        else:
+            return None
+    out = {k: _present[k] for k, _ in DIMS}
     out["total_score"] = sum(out[k] for k, _ in DIMS)   # ★ 自己加，不信模型
     out["reason"] = str(raw.get("reason", ""))[:60]
     out["tldr"] = str(raw.get("tldr", ""))[:200]
@@ -292,6 +318,7 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
     t0 = time.time()
     ok = fail = 0
     complete = []                 # ★ 真正跑完推理的那些（含判为不相关的只标题篇）
+    fail_why = []                 # ★ 2026-10-02：逐篇记录失败原因（诊断用）
     consec_fail = 0
     fused = None
     try:
@@ -304,14 +331,26 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
             if title_only:
                 n_title_only += 1
             res = None
+            why = ""
             for attempt in range(max_retries):
                 try:
                     raw = _call_text(ai, build_prompt(title, abstract))
-                    res = (normalize_titleonly(parse_json(raw)) if title_only
-                           else normalize(parse_json(raw)))
+                    _pj = parse_json(raw)
+                    if _pj is None:
+                        # ★ 2026-10-02：区分"没吐出 JSON"和"JSON 结构不对"——
+                        #   原来只有一句 `except Exception:` + 失败计数，
+                        #   出了 74 篇失败根本不知道为什么。
+                        why = f"不是合法 JSON（返回 {len(raw or '')} 字符）"
+                        time.sleep(0.4)
+                        continue
+                    res = (normalize_titleonly(_pj) if title_only else normalize(_pj))
                     if res:
                         break
-                except Exception:
+                    _need = ("relevant",) if title_only else tuple(k for k, _ in DIMS)
+                    _miss = [k for k in _need if k not in _pj]
+                    why = ("缺字段 " + ",".join(_miss)) if _miss else "字段值不合法"
+                except Exception as e:
+                    why = f"{type(e).__name__}: {str(e)[:70]}"
                     time.sleep(0.4)
             if res:
                 p.update(res)
@@ -321,6 +360,11 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
             else:
                 fail += 1
                 consec_fail += 1
+                fail_why.append({
+                    "title": title[:70], "title_only": title_only,
+                    "why": why or "未知",
+                    "abstract_len": len(abstract or ""),
+                })
 
             # ★ 2026-10-01【熔断】。服务中途 OOM/崩溃时，后面每一篇都会
             #   "异常 → sleep 0.4 → 重试 → 再异常"，一路算失败。
@@ -358,6 +402,18 @@ def score_all(papers, verbose=True, log_every=25, max_retries=2, quiet_below=0):
           f"（{el/max(total,1):.2f} s/篇）")
     print(f"        其中【有摘要·打过四维分】{n_scored} 篇；"
           f"【只标题·不打分】{n_title_only} 篇（相关 {n_rel}，不相关 {n_irrel}）")
+    if fail_why:
+        from collections import Counter as _C
+        _c = _C(w["why"] for w in fail_why)
+        print(f"  [失败原因] {len(fail_why)} 篇未能打分，原因分布：")
+        for _r, _n in _c.most_common(6):
+            print(f"       {_n:4d}  篇  {_r}")
+        _to = sum(1 for w in fail_why if w["title_only"])
+        _ab = sum(1 for w in fail_why if w["abstract_len"] > 2000)
+        print(f"       （其中只标题 {_to} 篇；摘要超过 2000 字符被截的 {_ab} 篇）")
+        for _w in fail_why[:3]:
+            print(f"       例：[{'只标题' if _w['title_only'] else '有摘要'}] "
+                  f"{_w['title'][:52]} → {_w['why']}")
 
     # ★ 2026-10-01【返回值必须包含判为"不相关"的只标题文献】。
     #   原来这里只留 `有分 or (只标题 and relevant)` ⇒ relevant=False 的

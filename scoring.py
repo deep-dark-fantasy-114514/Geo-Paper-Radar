@@ -230,7 +230,11 @@ def score_titleonly_with_deepseek(title, retries=2):
 # ★ 2026-10-01：记录【实际】跑了哪个打分器。原来日志是按配置变量 SCORER
 #   打印的，而本地 Qwen 挂掉时会静默回退 DeepSeek —— 于是日志显示"免费"，
 #   实际在按量计费。成本判断不能靠配置猜，要记事实。
-LAST_RUN = {"scorer": None, "count": 0, "fallback": False}
+# ★ 2026-10-02：`fallback` 原来一个布尔同时表示"整批回退"和"部分补送"，
+#   下游（邮件页脚 / 主程序汇总）因此会把"只补了 40 篇"说成"整批按量计费"。
+#   改成 mode + n 两个字段说清楚。
+LAST_RUN = {"scorer": None, "count": 0, "fallback": False,
+            "fallback_mode": None, "fallback_n": 0, "local_n": 0}
 
 
 def score_all_papers(papers, phase_label="DeepSeek"):
@@ -240,7 +244,8 @@ def score_all_papers(papers, phase_label="DeepSeek"):
     规模从 40 放开到 MAX_CANDIDATES=500。本地不可用时自动回退 DeepSeek。
     实际用了哪个记在 `LAST_RUN`（调用方可据此报成本）。
     """
-    LAST_RUN.update({"scorer": None, "count": 0, "fallback": False})
+    LAST_RUN.update({"scorer": None, "count": 0, "fallback": False,
+                     "fallback_mode": None, "fallback_n": 0, "local_n": 0})
     if SCORER == "local" and papers:
         print("\n" + "=" * 60)
         print(f"【第二阶段】本地 Qwen3.5-9B 多维度打分（免费，共 {len(papers)} 篇）")
@@ -272,8 +277,12 @@ def score_all_papers(papers, phase_label="DeepSeek"):
                 print(f"\n  [补送] 本地有 {len(_missed)}/{len(papers)} 篇没打上，"
                       f"转 DeepSeek 补打（上限 {MAX_DEEPSEEK_INPUT}）")
                 LAST_RUN["fallback"] = True
+                LAST_RUN["fallback_mode"] = "partial"
+                _n_local = len(scored)
                 _extra = _deepseek_batch(_missed[:MAX_DEEPSEEK_INPUT],
                                          phase_label + "·本地补漏")
+                LAST_RUN["local_n"] = _n_local
+                LAST_RUN["fallback_n"] = len(_extra)
                 scored = scored + _extra
                 if len(_missed) > MAX_DEEPSEEK_INPUT:
                     print(f"  [限额] 另有 {len(_missed) - MAX_DEEPSEEK_INPUT} 篇"
@@ -284,6 +293,7 @@ def score_all_papers(papers, phase_label="DeepSeek"):
             return scored
         print("  [回退] 本地打分不可用，改用 DeepSeek")
         LAST_RUN["fallback"] = True
+        LAST_RUN["fallback_mode"] = "full"
         # ★★★ 2026-10-01【安全熔断】★★★
         #   main() 里的 _cap 是按【配置的 SCORER】算的：配成 local 时
         #   MAX_CANDIDATES=None ⇒ 走"不截断"分支。可本地一旦挂掉就回退到这里，
