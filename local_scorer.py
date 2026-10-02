@@ -118,6 +118,10 @@ def build_prompt(title, abstract):
     return (
         f"{SYSTEM}\n\n"
         f"请按四个维度给下面这篇论文打分（每维 0-10 整数）：\n{dims_txt}\n\n"
+        # ★ 2026-10-02：与 DeepSeek 用同一份分档锚点（research_profile.SCORE_RUBRIC）。
+        #   原来两条打分器各说各话、都只写"是否涉及……"，没有 7 分和 8 分的界线
+        #   ⇒ 分数不可比，也就没法说"本地挂掉回退 DeepSeek"在业务上等价。
+        f"{SCORE_RUBRIC}\n"
         f"打分时注意：\n"
         f"- 泛泛相关（只在引言里提一句）给 2-4 分；真正以该主题为研究对象给 7-10 分\n"
         f"- 方法创新看的是【有没有新模型/新数据/新实验手段】，纯应用案例给低分\n"

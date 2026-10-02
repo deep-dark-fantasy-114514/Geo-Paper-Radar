@@ -76,6 +76,9 @@ OPENALEX_DAYS_LOOKBACK = 7       # 抓取过去 7 天
 # ---- DeepSeek 配置 ----
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"
+# ★ 2026-10-02：单次请求超时（秒）。无人值守任务必须有它 ——
+#   否则一次连接卡住就会把整轮打分拖死（sources.py 里每个 requests 都有 timeout）。
+DEEPSEEK_TIMEOUT = 90
 
 # ---- 筛选阈值（双轨制） ----
 TOTAL_SCORE_PASS = 30       # 轨道A：总分 ≥ 30/40
@@ -178,7 +181,8 @@ COARSE_MIN_SCORE = 2      # 加权分下限（锚定×2 + 泛化×1）
 # ---- 历史记录 & EndNote ----
 # ---- ★ 2026-10-01：研究画像 + 主题黑名单（定义在 research_profile.py，改那里即可）----
 from research_profile import (RESEARCH_PROFILE, BLACKLIST_TOPICS,
-                              BLACKLIST_TITLE_ONLY, QUALITATIVE_FIELDS)
+                              BLACKLIST_TITLE_ONLY, QUALITATIVE_FIELDS,
+                              SCORE_RUBRIC)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
